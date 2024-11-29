@@ -1,12 +1,30 @@
 <?php
-/*
-Plugin Name: Feed Rewriter Plugin
-Description: Mengambil artikel dari feed, menulis ulang dengan OpenAI, dan menerbitkannya sebagai postingan baru.
-Version: 1.3
-Author: Rohmat Ali Wardani
-Author URI: https://www.linkedin.com/in/rohmat-ali-wardani/
-*/
-
+/**
+ * Plugin Name: Feed Rewriter Plugin
+ * Plugin URI: https://github.com/raw-dani/Feed-Rewriter-Plugin
+ * Description: Plugin untuk mengambil feed RSS dan menulis ulang konten menggunakan OpenAI
+ * Version: 1.0.0
+ * Author: Rohmat Ali Wardani
+ * Author URI: https://www.linkedin.com/in/rohmat-ali-wardani/
+ * License: GPL v2 or later
+ * License URI: https://www.gnu.org/licenses/gpl-2.0.html
+ * Text Domain: feed-rewriter-plugin
+ * Domain Path: /languages
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+ */
 // Fungsi untuk membuat halaman pengaturan
 function frp_add_settings_page() {
     add_options_page(
@@ -34,60 +52,108 @@ function frp_render_settings_page() {
 
         <h2>Manual Execution</h2>
         <form method="post" action="">
+            <?php wp_nonce_field('frp_manual_execution', 'frp_nonce'); ?>
             <input type="submit" name="manual_execute" value="Run Now" class="button button-primary" />
         </form>
 
         <?php
         // Cek apakah tombol "Run Now" ditekan
-        if (isset($_POST['manual_execute'])) {
-            // Hanya menjalankan fungsi utama tanpa menjadwalkan cron ulang
-            update_option('frp_pause_cron', true); // Pause cron sebelum eksekusi manual
+        if (isset($_POST['manual_execute']) && check_admin_referer('frp_manual_execution', 'frp_nonce')) {
+            // Langsung jalankan fungsi tanpa mengubah status cron
+            frp_log_message("Memulai eksekusi manual...");
             frp_rewrite_feed_content();
-            update_option('frp_pause_cron', false); // Unpause cron setelah eksekusi manual
-
-            echo "<p>Manual execution triggered, content generation is running. Cron schedule remains unchanged.</p>";
+            echo "<div class='notice notice-success'><p>Manual execution completed. Check logs for details.</p></div>";
         }
         ?>
 
         <!-- Sidebar Kanan -->
         <div style="flex: 1; border-left: 1px solid #ddd; padding-left: 20px;">
+            
             <h2>Generated Articles (Last 20 Posts)</h2>
             <?php frp_display_generated_articles(20); ?>
-
-            <h2>Logs (Last 100 Entries)</h2>
-            <?php frp_display_log(100); ?>
+            
+            <h2>Log & Status</h2>
+            <div id="frp-log-container">
+                <!-- Log akan dimuat di sini -->
+            </div>
         </div>
+
+        <script type="text/javascript">
+            jQuery(document).ready(function($) {
+                // Fungsi untuk memuat log
+                function loadLog() {
+                    $.ajax({
+                        url: ajaxurl,
+                        type: 'POST',
+                        data: {
+                            action: 'frp_get_log',
+                            _wpnonce: '<?php echo wp_create_nonce("frp_get_log_nonce"); ?>'
+                        },
+                        success: function(response) {
+                            if(response.success) {
+                                $('#frp-log-container').html(response.data.log);
+                            }
+                        }
+                    });
+                }
+
+                // Muat log setiap menit
+                loadLog();
+                setInterval(loadLog, 60000);
+            });
+        </script>
     </div>
     <?php
 }
 
+// endpoint AJAX untuk mengambil log
+add_action('wp_ajax_frp_get_log', 'frp_get_log_ajax');
+function frp_get_log_ajax() {
+    check_ajax_referer('frp_get_log_nonce', '_wpnonce');
+    
+    // Ambil status cron terbaru
+    frp_check_cron_status();
+    
+    // Ambil log terbaru
+    $log_content = frp_display_log(50); // Tampilkan 20 log terakhir
+    
+    wp_send_json_success(['log' => $log_content]);
+}
+
+// cron event untuk pengecekan status
+if (!wp_next_scheduled('frp_check_cron_status_event')) {
+    wp_schedule_event(time(), 'every_minute', 'frp_check_cron_status_event');
+}
+add_action('frp_check_cron_status_event', 'frp_check_cron_status');
+
+// Tambahkan interval waktu kustom untuk cron
+add_filter('cron_schedules', 'frp_add_cron_intervals');
+function frp_add_cron_intervals($schedules) {
+    $schedules['every_minute'] = array(
+        'interval' => 60,
+        'display'  => 'Every Minute'
+    );
+    return $schedules;
+}
+
+// Bersihkan cron saat deaktivasi
+register_deactivation_hook(__FILE__, 'frp_deactivate_plugin');
+function frp_deactivate_plugin() {
+    wp_clear_scheduled_hook('frp_check_cron_status_event');
+    wp_clear_scheduled_hook('frp_cron_event');
+    frp_log_message("Plugin dinonaktifkan dan cron jobs dihentikan.");
+}
+
 // Fungsi untuk mendaftarkan interval cron kustom
 function frp_custom_cron_schedules($schedules) {
-    $interval = get_option('frp_cron_interval', 1); // Default 1 jam
+    $interval_minutes = get_option('frp_cron_interval', 60); // Default 60 menit
     $schedules['frp_custom_interval'] = [
-        'interval' => $interval * 3600, // Konversi jam ke detik
-        'display'  => sprintf(__('Every %d hours'), $interval)
+        'interval' => $interval_minutes * 60, // Konversi menit ke detik
+        'display'  => sprintf(__('Every %d minutes'), $interval_minutes)
     ];
     return $schedules;
 }
 add_filter('cron_schedules', 'frp_custom_cron_schedules');
-
-// Fungsi untuk menjadwalkan cron
-// function frp_schedule_feed_rewrite($force_reschedule = false) {
-//     $event_hook = 'frp_cron_event';
-    
-//     // Hapus jadwal yang ada jika diminta untuk reschedule
-//     if ($force_reschedule && wp_next_scheduled($event_hook)) {
-//         wp_clear_scheduled_hook($event_hook);
-//     }
-
-//     // Hanya jadwalkan jika belum ada jadwal
-//     if (!wp_next_scheduled($event_hook)) {
-//         $interval = get_option('frp_cron_interval', 1);
-//         wp_schedule_event(time(), 'frp_custom_interval', $event_hook);
-//         frp_log_message("Cron scheduled with {$interval} hour interval");
-//     }
-// }
 
 // Hook untuk aktivasi plugin
 function frp_on_activation() {
@@ -114,6 +180,12 @@ register_deactivation_hook(__FILE__, 'frp_on_deactivation');
 add_action('frp_cron_event', 'frp_rewrite_feed_content');
 
 function frp_rewrite_feed_content() {
+    // Cek apakah ini eksekusi manual atau cron
+    $is_manual = isset($_POST['manual_execute']);
+    
+    if (!$is_manual) {
+        frp_log_message("Memulai eksekusi cron...");
+    }
     // Cek apakah cron sedang berjalan
     $cron_running = get_transient('frp_cron_running');
     if ($cron_running) {
@@ -130,12 +202,6 @@ function frp_rewrite_feed_content() {
         // Cek status cron
         if ($cron_status === 'inactive') {
             frp_log_message("Cron job tidak dijalankan karena status inactive.");
-            delete_transient('frp_cron_running');
-            return;
-        }
-
-        if (get_option('frp_pause_cron', false)) {
-            frp_log_message("Cron job skipped due to manual execution pause.");
             delete_transient('frp_cron_running');
             return;
         }
@@ -184,19 +250,49 @@ function frp_rewrite_feed_content() {
             if ($xml->channel) {
                 frp_log_message("Detected RSS feed format");
                 foreach ($xml->channel->item as $item) {
-                    $original_title = (string)$item->title;
+                    $original_title = strip_tags((string)$item->title);
                     $link = (string)$item->link;
                     $pub_date = date('Y-m-d H:i:s', strtotime((string)$item->pubDate));
+
+                    // Reset image_url
+                    $image_url = '';
                     
-                    // Coba ambil gambar dari enclosure terlebih dahulu
-                    $image_url = (string)$item->enclosure['url'];
+                    // 1. Cek enclosure dengan namespace yang benar
+                    if (isset($item->enclosure)) {
+                        $image_url = (string)$item->enclosure['url'];
+                        frp_log_message("Image found from enclosure: " . $image_url);
+                    }
                     
-                    // Jika tidak ada enclosure, coba ambil dari description
+                    // 2. Jika tidak ada, coba ambil dari description
                     if (empty($image_url)) {
                         $description = (string)$item->description;
-                        if (preg_match('/<img[^>]+src=([\'"])?((?(1)[^\1]+|[^\s>]+))(?(1)\1)/', $description, $matches)) {
-                            $image_url = $matches[2];
+                        if (preg_match('/<img[^>]+src="([^"]+)"/', html_entity_decode($description), $matches)) {
+                            $image_url = $matches[1];
+                            frp_log_message("Image found from description: " . $image_url);
                         }
+                    }
+                    
+                    // Bersihkan URL gambar dari karakter HTML entities
+                    if (!empty($image_url)) {
+                        $image_url = html_entity_decode($image_url);
+                        // Pastikan URL gambar menggunakan HTTPS
+                        $image_url = str_replace('http://', 'https://', $image_url);
+                        frp_log_message("Final cleaned image URL: " . $image_url);
+                    }
+
+                    // Ambil deskripsi tanpa tag HTML
+                    $description = strip_tags(html_entity_decode((string)$item->description));
+                    
+                    // Ambil content:encoded jika ada
+                    $content_encoded = '';
+                    if (isset($item->children('content', true)->encoded)) {
+                        $content_encoded = strip_tags(html_entity_decode((string)$item->children('content', true)->encoded));
+                    }
+
+                    frp_log_message("Processing article: {$original_title}");
+                    frp_log_message("Description length: " . strlen($description));
+                    if (!empty($content_encoded)) {
+                        frp_log_message("Content:encoded length: " . strlen($content_encoded));
                     }
                     
                     // Jika masih tidak ada, baru coba ambil dari konten artikel
@@ -214,23 +310,38 @@ function frp_rewrite_feed_content() {
                     frp_log_message("Processing article: {$original_title}");
                     
                     // Ambil konten lengkap dari URL artikel
-                    $article_response = wp_remote_get($link);
-                    if (is_wp_error($article_response)) {
-                        frp_log_message("Error fetching article content: " . $article_response->get_error_message());
-                        continue;
-                    }
-
-                    $article_html = wp_remote_retrieve_body($article_response);
+                    frp_log_message("Fetching full article content from: " . $link);
                     
-                    // Gunakan fungsi ekstraksi konten
-                    $content = frp_extract_article_content($article_html, $link);
-                    if (empty($content)) {
-                        frp_log_message("Could not extract content from article URL: " . $link);
+                    $article_response = wp_remote_get($link, [
+                        'timeout' => 30,
+                        'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                        'headers' => [
+                            'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                            'Accept-Language' => 'en-US,en;q=0.5',
+                        ]
+                    ]);
+                    
+                    if (is_wp_error($article_response)) {
+                        frp_log_message("Error mengambil konten artikel: " . $article_response->get_error_message());
                         continue;
                     }
-
-                    frp_log_message("Successfully extracted content. Length: " . strlen($content) . " characters");
-
+            
+                    $article_html = wp_remote_retrieve_body($article_response);
+                    // Tambahkan ekstraksi konten khusus untuk CNN Indonesia
+                    $content = '';
+                    if (strpos($link, 'cnnindonesia.com') !== false) {
+                        $content = frp_extract_cnn_content($article_html);
+                    } else {
+                        $content = frp_extract_article_content($article_html, $link);
+                    }
+            
+                    if (empty($content)) {
+                        frp_log_message("Tidak dapat mengekstrak konten dari artikel: " . $link);
+                        continue;
+                    }
+            
+                    frp_log_message("Berhasil mengekstrak konten. Panjang: " . strlen($content) . " karakter");
+                    
                     // Simpan konten mentah untuk debugging
                     $raw_content_log = plugin_dir_path(__FILE__) . 'raw_article_content.log';
                     file_put_contents($raw_content_log, "=== Article Content from {$link} ===\n\n{$content}");
@@ -347,16 +458,60 @@ function frp_rewrite_feed_content() {
         // Hapus flag cron running
         delete_transient('frp_cron_running');
     }
+
+    if (!$is_manual) {
+        frp_check_cron_status();
+    }
+}
+
+// hook untuk mengecek status cron secara berkala
+add_action('init', 'frp_check_cron_status');
+
+// Tambahkan fungsi khusus untuk mengekstrak konten CNN Indonesia
+function frp_extract_cnn_content($html) {
+    $doc = new DOMDocument();
+    @$doc->loadHTML(mb_convert_encoding($html, 'HTML-ENTITIES', 'UTF-8'));
+    $xpath = new DOMXPath($doc);
+    
+    // Selector khusus untuk CNN Indonesia
+    $selectors = [
+        "//div[contains(@class, 'detail-text')]",
+        "//div[contains(@class, 'content-article')]//p",
+        "//div[contains(@class, 'detail_text')]",
+        "//div[contains(@class, 'article-content')]"
+    ];
+    
+    foreach ($selectors as $selector) {
+        $nodes = $xpath->query($selector);
+        if ($nodes->length > 0) {
+            $content = '';
+            foreach ($nodes as $node) {
+                // Skip jika paragraf kosong atau hanya berisi spasi
+                $text = trim($node->textContent);
+                if (!empty($text)) {
+                    $content .= $text . "\n\n";
+                }
+            }
+            
+            if (!empty($content)) {
+                frp_log_message("Berhasil mengekstrak konten CNN Indonesia");
+                return trim($content);
+            }
+        }
+    }
+    
+    frp_log_message("Gagal mengekstrak konten CNN Indonesia dengan selector yang tersedia");
+    return '';
 }
 
 // Fungsi untuk mengubah interval cron
-function frp_update_cron_interval($new_interval) {
-    $old_interval = get_option('frp_cron_interval', 1);
+function frp_update_cron_interval($new_interval_minutes) {
+    $old_interval = get_option('frp_cron_interval', 60);
     
-    if ($new_interval != $old_interval) {
-        update_option('frp_cron_interval', $new_interval);
-        frp_schedule_feed_rewrite(true); // Reschedule dengan interval baru
-        frp_log_message("Cron interval updated to {$new_interval} hours");
+    if ($new_interval_minutes != $old_interval) {
+        update_option('frp_cron_interval', $new_interval_minutes);
+        frp_schedule_feed_rewrite(true);
+        frp_log_message("Interval cron diperbarui menjadi {$new_interval_minutes} menit");
     }
 }
 
@@ -374,25 +529,40 @@ add_action('admin_init', 'frp_save_settings');
 // Fungsi untuk menampilkan log dari file
 function frp_display_log($max_logs = 100) {
     $log_file = plugin_dir_path(__FILE__) . 'frp_log.txt';
+    $output = '';
 
     if (file_exists($log_file)) {
         $log_entries = array_reverse(file($log_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES));
         $display_logs = array_slice($log_entries, 0, $max_logs);
 
-        echo '<div style="max-height: 300px; overflow-y: auto; background: #f9f9f9; padding: 10px; border: 1px solid #ccc;">';
+        $output .= '<div style="max-height: 300px; overflow-y: auto; background: #f9f9f9; padding: 10px; border: 1px solid #ccc;">';
         if (!empty($display_logs)) {
-            echo '<ul>';
+            $output .= '<ul style="margin: 0; padding-left: 20px;">';
             foreach ($display_logs as $log) {
-                echo '<li>' . esc_html($log) . '</li>';
+                $output .= '<li>' . esc_html($log) . '</li>';
             }
-            echo '</ul>';
+            $output .= '</ul>';
         } else {
-            echo '<p>No log entries available.</p>';
+            $output .= '<p>No log entries available.</p>';
         }
-        echo '</div>';
+        $output .= '</div>';
     } else {
-        echo '<p>Log file not found.</p>';
+        $output .= '<p>Log file not found.</p>';
     }
+
+    return $output;
+}
+
+// Modifikasi fungsi aktivasi plugin untuk tidak menjalankan generate content
+register_activation_hook(__FILE__, 'frp_activate_plugin');
+function frp_activate_plugin() {
+    // Hanya inisialisasi opsi default
+    add_option('frp_cron_interval', 1);
+    add_option('frp_cron_status', 'active');
+    add_option('frp_processed_urls', array());
+    
+    // Log aktivasi plugin
+    frp_log_message("Plugin diaktifkan. Silakan konfigurasi pengaturan dan klik Save atau Run Now untuk memulai.");
 }
 
 // Fungsi untuk menampilkan daftar artikel yang telah digenerate maksimal 20 pos
@@ -669,8 +839,9 @@ function frp_api_key_callback() {
 }
 
 function frp_cron_interval_callback() {
-    $cron_interval = get_option('frp_cron_interval', 1);
-    echo "<input type='number' name='frp_cron_interval' value='" . esc_attr($cron_interval) . "' min='1' />";
+    $interval_minutes = get_option('frp_cron_interval', 60);
+    echo "<input type='number' name='frp_cron_interval' value='" . esc_attr($interval_minutes) . "' min='1' /> menit";
+    echo "<p class='description'>Masukkan interval dalam menit (minimal 1 menit)</p>";
 }
 
 function frp_custom_prompt_callback() {
@@ -686,6 +857,15 @@ function frp_model_callback() {
             <option value='gpt-4o-mini' " . selected($model, 'gpt-4o-mini', false) . ">gpt-4o-mini</option>
           </select>";
 }
+
+function frp_validate_settings($input) {
+    // Pastikan interval minimal 1 menit
+    if (isset($input['frp_cron_interval'])) {
+        $input['frp_cron_interval'] = max(1, intval($input['frp_cron_interval']));
+    }
+    return $input;
+}
+add_filter('pre_update_option_frp_cron_interval', 'frp_validate_settings');
 
 // Fungsi callback untuk pengaturan "fetch_latest_only"
 function frp_fetch_latest_only_callback() {
@@ -925,100 +1105,160 @@ function frp_extract_article_image($html, $url) {
 
 // Fungsi untuk mengatur featured image dengan nama file dan alt berdasarkan judul
 function frp_set_featured_image($post_id, $image_url, $post_title, $content) {
-    // Jika tidak ada URL gambar, coba ambil gambar pertama dari konten
     if (empty($image_url)) {
-        $doc = new DOMDocument();
-        @$doc->loadHTML(mb_convert_encoding($content, 'HTML-ENTITIES', 'UTF-8'));
-        $xpath = new DOMXPath($doc);
-        $img_tags = $xpath->query("//img");
-
-        if ($img_tags->length > 0) {
-            $image_url = $img_tags->item(0)->getAttribute('src');
-            frp_log_message("Using first image from content as featured image: " . $image_url);
-        } else {
-            frp_log_message("No image found in content to use as featured image.");
-            return;
-        }
+        frp_log_message("No image URL provided for featured image");
+        return;
     }
 
-    // Mengambil direktori upload WordPress
-    $upload_dir = wp_upload_dir();
-    $image_data = @file_get_contents($image_url);
+    frp_log_message("Attempting to set featured image from URL: " . $image_url);
+
+    // Bersihkan URL gambar
+    $image_url = html_entity_decode($image_url);
+    
+    // Tambahkan konteks stream untuk HTTPS
+    $context = stream_context_create([
+        'ssl' => [
+            'verify_peer' => false,
+            'verify_peer_name' => false,
+        ],
+        'http' => [
+            'user_agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        ]
+    ]);
+
+    // Coba ambil gambar dengan konteks yang sudah diatur
+    $image_data = @file_get_contents($image_url, false, $context);
 
     if ($image_data === false) {
         frp_log_message("Failed to download image from URL: " . $image_url);
         return;
     }
 
-    // Membuat nama file berdasarkan judul post
-    $filename = sanitize_file_name($post_title) . '.' . pathinfo($image_url, PATHINFO_EXTENSION);
+    $upload_dir = wp_upload_dir();
+    
+    // Dapatkan ekstensi file dari URL
+    $file_extension = pathinfo(parse_url($image_url, PHP_URL_PATH), PATHINFO_EXTENSION);
+    if (empty($file_extension)) {
+        $file_extension = 'jpg'; // default to jpg if no extension found
+    }
 
-    // Menentukan path file
+    // Buat nama file yang aman
+    $filename = sanitize_file_name($post_title . '-' . uniqid() . '.' . $file_extension);
+
     if (wp_mkdir_p($upload_dir['path'])) {
         $file = $upload_dir['path'] . '/' . $filename;
     } else {
         $file = $upload_dir['basedir'] . '/' . $filename;
     }
 
-    // Menyimpan gambar ke direktori
-    file_put_contents($file, $image_data);
+    // Simpan file
+    if (file_put_contents($file, $image_data)) {
+        frp_log_message("Image saved successfully to: " . $file);
+        
+        // Set attachment
+        $wp_filetype = wp_check_filetype($filename, null);
+        $attachment = array(
+            'post_mime_type' => $wp_filetype['type'],
+            'post_title' => $post_title,
+            'post_content' => '',
+            'post_status' => 'inherit'
+        );
 
-    // Memeriksa tipe file
-    $wp_filetype = wp_check_filetype($filename, null);
-
-    // Membuat attachment post untuk gambar
-    $attachment = [
-        'post_mime_type' => $wp_filetype['type'],
-        'post_title'     => $post_title, // Menggunakan judul untuk alt text
-        'post_content'   => '',
-        'post_status'    => 'inherit'
-    ];
-
-    // Menyisipkan attachment ke post
-    $attach_id = wp_insert_attachment($attachment, $file, $post_id);
-
-    // Menghasilkan metadata untuk attachment
-    require_once(ABSPATH . 'wp-admin/includes/image.php');
-    $attach_data = wp_generate_attachment_metadata($attach_id, $file);
-    wp_update_attachment_metadata($attach_id, $attach_data);
-
-    // Mengatur featured image
-    set_post_thumbnail($post_id, $attach_id);
-
-    // Mengatur alt text untuk gambar
-    update_post_meta($attach_id, '_wp_attachment_image_alt', $post_title);
+        $attach_id = wp_insert_attachment($attachment, $file, $post_id);
+        if ($attach_id) {
+            require_once(ABSPATH . 'wp-admin/includes/image.php');
+            $attach_data = wp_generate_attachment_metadata($attach_id, $file);
+            wp_update_attachment_metadata($attach_id, $attach_data);
+            set_post_thumbnail($post_id, $attach_id);
+            frp_log_message("Featured image set successfully with ID: " . $attach_id);
+        } else {
+            frp_log_message("Failed to create attachment for image");
+        }
+    } else {
+        frp_log_message("Failed to save image file");
+    }
 }
 
 // Fungsi untuk mencatat log
-function frp_log_message($message) {
-    $log_file = plugin_dir_path(__FILE__) . 'frp_log.txt';
-    $timestamp = date("Y-m-d H:i:s");
-    file_put_contents($log_file, "[$timestamp] $message\n", FILE_APPEND);
-}
-
-// Fungsi untuk menjadwalkan ulang cron berdasarkan interval
-function frp_schedule_feed_rewrite($reset = false, $manual_trigger = false) {
-    $cron_status = get_option('frp_cron_status', 'inactive');
-    $interval = get_option('frp_cron_interval', 1) * HOUR_IN_SECONDS;
-
-    // Hapus jadwal cron yang ada jika opsi reset aktif
-    if ($reset) {
-        $timestamp = wp_next_scheduled('frp_rewrite_feed_content_event');
-        if ($timestamp) {
-            wp_unschedule_event($timestamp, 'frp_rewrite_feed_content_event');
-        }
-    }
-
-    // Jangan jadwalkan cron jika statusnya "inactive" kecuali jika ada pemicu manual
-    if ($cron_status === 'inactive' && !$manual_trigger) {
-        frp_log_message("Cron tidak dijadwalkan karena plugin dalam status inactive.");
+function frp_log_message($message, $type = 'info') {
+    static $last_message = '';
+    static $last_timestamp = 0;
+    
+    // Hindari duplikasi pesan dalam 60 detik
+    if ($message === $last_message && (time() - $last_timestamp) < 60) {
         return;
     }
+    
+    $log_file = plugin_dir_path(__FILE__) . 'frp_log.txt';
+    $timestamp = current_time('Y-m-d H:i:s');
+    $source = isset($_POST['manual_execute']) ? '[Manual]' : '[Cron]';
+    
+    $log_entry = "[$timestamp] $source $message\n";
+    
+    $last_message = $message;
+    $last_timestamp = time();
+    
+    file_put_contents($log_file, $log_entry, FILE_APPEND);
+}
 
-    // Jadwalkan ulang cron berdasarkan interval saat ini jika tidak ada cron yang terjadwal
-    if (!wp_next_scheduled('frp_rewrite_feed_content_event')) {
-        wp_schedule_event(time(), $interval, 'frp_rewrite_feed_content_event');
-        frp_log_message("Cron job dijadwalkan untuk berjalan setiap {$interval} detik.");
+
+// Fungsi untuk menjadwalkan ulang cron berdasarkan interval
+function frp_schedule_feed_rewrite($force_reschedule = false) {
+    static $is_scheduling = false;
+    
+    if ($is_scheduling) {
+        return;
+    }
+    
+    $is_scheduling = true;
+    
+    try {
+        $event_hook = 'frp_cron_event';
+        $existing_schedule = wp_next_scheduled($event_hook);
+        $interval_minutes = get_option('frp_cron_interval', 60) * 60; // Konversi ke detik
+        
+        if (!$existing_schedule || ($force_reschedule && $existing_schedule)) {
+            wp_clear_scheduled_hook($event_hook);
+            $next_run = time() + $interval_minutes;
+            wp_schedule_event($next_run, 'frp_custom_interval', $event_hook);
+            frp_log_message("Cron dijadwalkan untuk: " . date('Y-m-d H:i:s', $next_run));
+        }
+    } finally {
+        $is_scheduling = false;
+    }
+}
+
+// Hapus dan perbaiki hook-hook yang ada
+function frp_init_hooks() {
+    // Hapus hook yang mungkin menyebabkan pemanggilan berulang
+    remove_action('wp', 'frp_schedule_feed_rewrite');
+    remove_action('init', 'frp_check_cron_status');
+    
+    // Tambahkan hook yang diperlukan
+    add_action('frp_cron_event', 'frp_rewrite_feed_content');
+}
+add_action('init', 'frp_init_hooks');
+
+// fungsi untuk mengecek dan log status cron
+function frp_check_cron_status() {
+    static $last_status_check = 0;
+    $check_interval = 300; // Cek setiap 5 menit
+    
+    if ((time() - $last_status_check) < $check_interval) {
+        return;
+    }
+    
+    $event_hook = 'frp_cron_event';
+    $next_scheduled = wp_next_scheduled($event_hook);
+    
+    if ($next_scheduled) {
+        $time_left = $next_scheduled - time();
+        if ($time_left > 0) {
+            $minutes = floor($time_left / 60);
+            $seconds = $time_left % 60;
+            frp_log_message("Waktu tersisa hingga eksekusi cron berikutnya: {$minutes}m {$seconds}d");
+            $last_status_check = time();
+        }
     }
 }
 
@@ -1030,15 +1270,15 @@ add_action('wp', 'frp_schedule_feed_rewrite');
 // Hubungkan dengan fungsi utama
 add_action('frp_rewrite_feed_content_event', 'frp_rewrite_feed_content');
 
-// Hapus jadwal saat plugin dinonaktifkan
-function frp_deactivate_plugin() {
-    $timestamp = wp_next_scheduled('frp_rewrite_feed_content_event');
-    if ($timestamp) {
-        wp_unschedule_event($timestamp, 'frp_rewrite_feed_content_event');
-    }
-    frp_log_message("Cron job unscheduled upon plugin deactivation.");
-}
-register_deactivation_hook(__FILE__, 'frp_deactivate_plugin');
+// // Hapus jadwal saat plugin dinonaktifkan
+// function frp_deactivate_plugin() {
+//     $timestamp = wp_next_scheduled('frp_rewrite_feed_content_event');
+//     if ($timestamp) {
+//         wp_unschedule_event($timestamp, 'frp_rewrite_feed_content_event');
+//     }
+//     frp_log_message("Cron job unscheduled upon plugin deactivation.");
+// }
+// register_deactivation_hook(__FILE__, 'frp_deactivate_plugin');
 
 // Fungsi helper untuk ekstraksi konten
 function frp_extract_article_content($html, $url) {
@@ -1046,22 +1286,47 @@ function frp_extract_article_content($html, $url) {
     @$doc->loadHTML(mb_convert_encoding($html, 'HTML-ENTITIES', 'UTF-8'));
     $xpath = new DOMXPath($doc);
     
-    // Daftar selector yang umum digunakan untuk konten artikel
-    $selectors = [
-        "//article",
-        "//main",
-        "//div[contains(@class, 'post-content')]",
-        "//div[contains(@class, 'article-content')]",
-        "//div[contains(@class, 'entry-content')]"
-    ];
-    
-    foreach ($selectors as $selector) {
-        $nodes = $xpath->query($selector);
-        if ($nodes->length > 0) {
-            return $nodes->item(0)->textContent;
+    // Selector khusus untuk motorsport.com
+    if (strpos($url, 'motorsport.com') !== false) {
+        // Coba ambil konten dari artikel motorsport.com
+        $selectors = [
+            "//div[contains(@class, 'ms-article-content')]//p",
+            "//div[contains(@class, 'text-content')]//p",
+            "//div[contains(@class, 'article-content')]//p"
+        ];
+        
+        foreach ($selectors as $selector) {
+            $paragraphs = $xpath->query($selector);
+            if ($paragraphs->length > 0) {
+                $content = '';
+                foreach ($paragraphs as $p) {
+                    $content .= $p->textContent . "\n\n";
+                }
+                if (!empty($content)) {
+                    frp_log_message("Berhasil mengekstrak konten");
+                    return trim($content);
+                }
+            }
         }
     }
     
-    frp_log_message("No content found using common selectors for URL: " . $url);
+    // Selector default untuk situs lain
+    $default_selectors = [
+        "//article[contains(@class, 'article-content')]",
+        "//div[contains(@class, 'article-body')]",
+        "//div[contains(@class, 'entry-content')]",
+        "//main//article",
+        "//div[contains(@class, 'post-content')]"
+    ];
+    
+    foreach ($default_selectors as $selector) {
+        $nodes = $xpath->query($selector);
+        if ($nodes->length > 0) {
+            return trim($nodes->item(0)->textContent);
+        }
+    }
+    
+    frp_log_message("Tidak dapat menemukan konten dengan selector yang tersedia: " . $url);
     return '';
 }
+
