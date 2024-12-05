@@ -1,0 +1,14 @@
+# File log
+*.log
+
+# File cache
+*.cache
+
+# File sistem WordPress
+.DS_Store
+.htaccess
+wp-config.php
+
+# File temporary
+*.tmp
+*.bak 
