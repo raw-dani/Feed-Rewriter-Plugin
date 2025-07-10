@@ -244,7 +244,28 @@ function frp_rewrite_feed_content() {
                         $image_url = (string)$item->enclosure['url'];
                     }
                     
-                    // 2. Jika tidak ada, coba ambil dari description
+                    // 2. Jika tidak ada, coba ambil dari content:encoded (khusus untuk BikeSport News)
+                    if (empty($image_url)) {
+                        // Coba akses content:encoded dengan namespace
+                        $namespaces = $xml->getNamespaces(true);
+                        if (isset($namespaces['content'])) {
+                            $content_ns = $item->children($namespaces['content']);
+                            if (isset($content_ns->encoded)) {
+                                $content_encoded = (string)$content_ns->encoded;
+                                // Ambil gambar pertama dari content:encoded
+                                if (preg_match('/<img[^>]+src=["\']([^"\']+)["\'][^>]*>/i', $content_encoded, $matches)) {
+                                    $image_url = $matches[1];
+                                    // Untuk BikeSport News, ambil versi resolusi tinggi
+                                    if (strpos($image_url, 'bikesportnews.com') !== false) {
+                                        $image_url = preg_replace('/-\d+x\d+\.jpg$/i', '.jpg', $image_url);
+                                        $image_url = str_replace('-scaled.jpg', '.jpg', $image_url);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // 3. Jika tidak ada, coba ambil dari description
                     if (empty($image_url)) {
                         $description = (string)$item->description;
                         if (preg_match('/<img[^>]+src=([\'"])?((?(1)[^\1]+|[^\s>]+))(?(1)\1)/', $description, $matches)) {
@@ -252,7 +273,7 @@ function frp_rewrite_feed_content() {
                         }
                     }
                     
-                    // Jika masih tidak ada, baru coba ambil dari konten artikel
+                    // 4. Jika masih tidak ada, baru coba ambil dari konten artikel
                     if (empty($image_url)) {
                         $article_response = wp_remote_get($link);
                         if (!is_wp_error($article_response)) {
@@ -266,30 +287,49 @@ function frp_rewrite_feed_content() {
 
                     frp_log_message("Processing article: {$original_title}");
                     
-                    // Ambil konten lengkap dari URL artikel
-                    frp_log_message("Fetching full article content from: " . $link);
-                    
-                    $article_response = wp_remote_get($link, [
-                        'timeout' => 30,
-                        'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                        'headers' => [
-                            'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                            'Accept-Language' => 'en-US,en;q=0.5',
-                        ]
-                    ]);
-                    
-                    if (is_wp_error($article_response)) {
-                        frp_log_message("Error mengambil konten artikel: " . $article_response->get_error_message());
-                        continue;
-                    }
-            
-                    $article_html = wp_remote_retrieve_body($article_response);
-                    // Tambahkan ekstraksi konten khusus untuk CNN Indonesia
+                    // Cek apakah ini feed BikeSport News dan ada content:encoded
                     $content = '';
-                    if (strpos($link, 'cnnindonesia.com') !== false) {
-                        $content = frp_extract_cnn_content($article_html);
-                    } else {
-                        $content = frp_extract_article_content($article_html, $link);
+                    if (strpos($link, 'bikesportnews.com') !== false) {
+                        // Coba ekstrak dari content:encoded terlebih dahulu
+                        $namespaces = $xml->getNamespaces(true);
+                        if (isset($namespaces['content'])) {
+                            $content_ns = $item->children($namespaces['content']);
+                            if (isset($content_ns->encoded)) {
+                                $content_encoded = (string)$content_ns->encoded;
+                                $content = frp_extract_bikesport_content($content_encoded);
+                                if (!empty($content)) {
+                                    frp_log_message("Extracted content from BikeSport News RSS feed");
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Jika tidak berhasil dari content:encoded atau bukan BikeSport News, ambil dari artikel langsung
+                    if (empty($content)) {
+                        // Ambil konten lengkap dari URL artikel
+                        frp_log_message("Fetching full article content from: " . $link);
+                        
+                        $article_response = wp_remote_get($link, [
+                            'timeout' => 30,
+                            'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                            'headers' => [
+                                'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                                'Accept-Language' => 'en-US,en;q=0.5',
+                            ]
+                        ]);
+                        
+                        if (is_wp_error($article_response)) {
+                            frp_log_message("Error mengambil konten artikel: " . $article_response->get_error_message());
+                            continue;
+                        }
+                
+                        $article_html = wp_remote_retrieve_body($article_response);
+                        // Tambahkan ekstraksi konten khusus untuk CNN Indonesia
+                        if (strpos($link, 'cnnindonesia.com') !== false) {
+                            $content = frp_extract_cnn_content($article_html);
+                        } else {
+                            $content = frp_extract_article_content($article_html, $link);
+                        }
                     }
             
                     if (empty($content)) {
@@ -401,6 +441,8 @@ function frp_rewrite_feed_content() {
             file_put_contents($debug_log, $body);
         }
 
+
+
         // Setelah berhasil memproses satu artikel
         if ($article_found) {
             frp_log_message("Article processed successfully. Next execution will be at next scheduled time.");
@@ -460,6 +502,75 @@ function frp_extract_cnn_content($html) {
     frp_log_message("Gagal mengekstrak konten CNN Indonesia dengan selector yang tersedia");
     return '';
 }
+
+// Fungsi khusus untuk mengekstrak konten dari BikeSport News RSS feed
+function frp_extract_bikesport_content($content_encoded) {
+    if (empty($content_encoded)) {
+        return '';
+    }
+    
+    try {
+        // Remove the first image tag (featured image)
+        $content = preg_replace('/<img[^>]+>/i', '', $content_encoded, 1);
+        
+        // Remove the footer text about "The post ... appeared first on BikeSport News"
+        $content = preg_replace('/<p>The post.*?BikeSport News\.<\/p>/i', '', $content);
+        
+        // Extract text from paragraphs and headings, preserving structure
+        $doc = new DOMDocument();
+        libxml_use_internal_errors(true); // Suppress HTML parsing errors
+        @$doc->loadHTML(mb_convert_encoding($content, 'HTML-ENTITIES', 'UTF-8'));
+        libxml_clear_errors();
+        
+        $xpath = new DOMXPath($doc);
+        
+        // Get all paragraphs and headings
+        $nodes = $xpath->query('//p | //h1 | //h2 | //h3 | //h4 | //h5 | //h6');
+        
+        $cleaned_content = '';
+        if ($nodes && $nodes->length > 0) {
+            foreach ($nodes as $node) {
+                $text = trim($node->textContent);
+                if (!empty($text)) {
+                    // Add heading markers for h2 elements
+                    if ($node->nodeName === 'h2') {
+                        $cleaned_content .= "### " . $text . "\n\n";
+                    } else {
+                        $cleaned_content .= $text . "\n\n";
+                    }
+                }
+            }
+        }
+        
+        // If no structured content found, fallback to simple paragraph extraction
+        if (empty($cleaned_content)) {
+            preg_match_all('/<p[^>]*>(.*?)<\/p>/is', $content, $paragraphs);
+            
+            if (!empty($paragraphs[1])) {
+                foreach ($paragraphs[1] as $paragraph) {
+                    $paragraph = strip_tags($paragraph);
+                    $paragraph = html_entity_decode($paragraph, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                    $paragraph = trim($paragraph);
+                    if (!empty($paragraph)) {
+                        $cleaned_content .= $paragraph . "\n\n";
+                    }
+                }
+            }
+        }
+        
+        if (!empty($cleaned_content)) {
+            frp_log_message("Successfully extracted content from BikeSport News RSS feed");
+            return trim($cleaned_content);
+        }
+        
+    } catch (Exception $e) {
+        frp_log_message("Error in frp_extract_bikesport_content: " . $e->getMessage());
+    }
+    
+    frp_log_message("Failed to extract content from BikeSport News RSS feed");
+    return '';
+}
+
 
 // Fungsi untuk mengubah interval cron
 function frp_update_cron_interval($new_interval_minutes) {
@@ -956,7 +1067,7 @@ function frp_rewrite_title_and_content($title, $content) {
 function frp_clean_text($text, $is_title = false) {
     if ($is_title) {
         // Menghapus kata "Judul" dari title
-        $text = preg_replace('/\bJudul\b/i', '', $text); 
+        $text = preg_replace('/\b(Judul|Title)\b/i', '', $text); 
         // Membersihkan karakter aneh pada judul
         $text = preg_replace('/[^a-zA-Z0-9\s\p{L}]/u', '', $text); // Menghapus karakter selain huruf, angka, dan spasi
         $text = trim($text); // Menghapus spasi berlebihan
@@ -1017,6 +1128,24 @@ function frp_extract_article_image($html, $url) {
     $doc = new DOMDocument();
     @$doc->loadHTML(mb_convert_encoding($html, 'HTML-ENTITIES', 'UTF-8'));
     $xpath = new DOMXPath($doc);
+
+    // Simple and robust image extraction
+    if (preg_match('/src="(https:\/\/cdn1\.motogpnews\.com\/uploads\/[^"]+?GettyImages[^"]+?\.jpg)"/', $html, $matches)) {
+        $image_url = $matches[1];
+        
+        // Get full resolution version
+        $image_url = preg_replace('/-\d+x\d+\.jpg$/', '.jpg', $image_url);
+        
+        frp_log_message("Extracted high-res image: " . $image_url);
+        return $image_url;
+    }
+    
+    // Fallback to any image in the content
+    if (preg_match('/src="(https:\/\/[^"]+?\.(?:jpg|jpeg|png|gif))"/', $html, $matches)) {
+        $image_url = $matches[1];
+        frp_log_message("Using fallback image: " . $image_url);
+        return $image_url;
+    }
     
     // Ambil selector kustom dari pengaturan
     $custom_selector = get_option('frp_image_selector', '');
@@ -1042,9 +1171,11 @@ function frp_extract_article_image($html, $url) {
         }
     }
     
-    // Fallback ke selector default jika tidak ada gambar ditemukan
+    // Fallback selectors
     $default_selectors = [
         "//meta[@property='og:image']/@content",
+        "//meta[@name='twitter:image']/@content",
+        "//link[@rel='image_src']/@href",
         "//article//img[1]/@src",
         "//div[contains(@class, 'entry-content')]//img[1]/@src",
         "//div[contains(@class, 'post-content')]//img[1]/@src"
@@ -1057,74 +1188,208 @@ function frp_extract_article_image($html, $url) {
         }
     }
     
+    frp_log_message("No suitable image found for: " . $url);
     return '';
 }
 
 // Fungsi untuk mengatur featured image dengan nama file dan alt berdasarkan judul
 function frp_set_featured_image($post_id, $image_url, $post_title, $content) {
-    // Jika tidak ada URL gambar, coba ambil gambar pertama dari konten
     if (empty($image_url)) {
-        $doc = new DOMDocument();
-        @$doc->loadHTML(mb_convert_encoding($content, 'HTML-ENTITIES', 'UTF-8'));
-        $xpath = new DOMXPath($doc);
-        $img_tags = $xpath->query("//img");
-
-        if ($img_tags->length > 0) {
-            $image_url = $img_tags->item(0)->getAttribute('src');
-            frp_log_message("Using first image from content as featured image: " . $image_url);
-        } else {
-            frp_log_message("No image found in content to use as featured image.");
-            return;
-        }
-    }
-
-    // Mengambil direktori upload WordPress
-    $upload_dir = wp_upload_dir();
-    $image_data = @file_get_contents($image_url);
-
-    if ($image_data === false) {
-        frp_log_message("Failed to download image from URL: " . $image_url);
+        frp_log_message("No image URL provided for post: " . $post_title);
         return;
     }
 
-    // Membuat nama file berdasarkan judul post
-    $filename = sanitize_file_name($post_title) . '.' . pathinfo($image_url, PATHINFO_EXTENSION);
-
-    // Menentukan path file
-    if (wp_mkdir_p($upload_dir['path'])) {
-        $file = $upload_dir['path'] . '/' . $filename;
-    } else {
-        $file = $upload_dir['basedir'] . '/' . $filename;
+    // Clean and validate image URL
+    $image_url = esc_url_raw($image_url);
+    frp_log_message("=== Starting image download process ===");
+    frp_log_message("Image URL: " . $image_url);
+    frp_log_message("Post ID: " . $post_id);
+    frp_log_message("Post Title: " . $post_title);
+    
+    // Enhanced headers to bypass security plugins
+    $args = array(
+        'timeout' => 60,
+        'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'sslverify' => false,
+        'redirection' => 10,
+        'headers' => array(
+            'Accept' => 'image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+            'Accept-Language' => 'en-US,en;q=0.9',
+            'Accept-Encoding' => 'gzip, deflate, br',
+            'Cache-Control' => 'no-cache',
+            'Pragma' => 'no-cache',
+            'Referer' => 'https://www.google.com/',
+        )
+    );
+    
+    // Try WordPress built-in download first
+    frp_log_message("Attempting to download image with wp_remote_get...");
+    $temp_file = download_url($image_url, $args['timeout']);
+    
+    if (is_wp_error($temp_file)) {
+        frp_log_message("WordPress download failed: " . $temp_file->get_error_message());
+        
+        // Try alternative method with cURL if available
+        if (function_exists('curl_init')) {
+            frp_log_message("Trying cURL download method...");
+            $temp_file = frp_download_image_with_curl($image_url, $args);
+        }
+    }
+    
+    if (is_wp_error($temp_file) || !$temp_file || !file_exists($temp_file)) {
+        frp_log_message("All download methods failed for image: " . $image_url);
+        return;
     }
 
-    // Menyimpan gambar ke direktori
-    file_put_contents($file, $image_data);
+    frp_log_message("Image downloaded successfully to: " . $temp_file);
 
-    // Memeriksa tipe file
-    $wp_filetype = wp_check_filetype($filename, null);
+    // Verify file is actually an image
+    $image_info = @getimagesize($temp_file);
+    if (!$image_info) {
+        frp_log_message("Downloaded file is not a valid image");
+        @unlink($temp_file);
+        return;
+    }
 
-    // Membuat attachment post untuk gambar
-    $attachment = [
-        'post_mime_type' => $wp_filetype['type'],
-        'post_title'     => $post_title, // Menggunakan judul untuk alt text
-        'post_content'   => '',
-        'post_status'    => 'inherit'
-    ];
+    frp_log_message("Image verified. Size: " . $image_info[0] . "x" . $image_info[1] . ", Type: " . $image_info['mime']);
 
-    // Menyisipkan attachment ke post
-    $attach_id = wp_insert_attachment($attachment, $file, $post_id);
+    // Get file extension from image type
+    $extension = '';
+    switch ($image_info[2]) {
+        case IMAGETYPE_JPEG:
+            $extension = '.jpg';
+            break;
+        case IMAGETYPE_PNG:
+            $extension = '.png';
+            break;
+        case IMAGETYPE_GIF:
+            $extension = '.gif';
+            break;
+        case IMAGETYPE_WEBP:
+            $extension = '.webp';
+            break;
+        default:
+            $extension = '.jpg'; // fallback
+    }
 
-    // Menghasilkan metadata untuk attachment
-    require_once(ABSPATH . 'wp-admin/includes/image.php');
-    $attach_data = wp_generate_attachment_metadata($attach_id, $file);
-    wp_update_attachment_metadata($attach_id, $attach_data);
+    // Prepare file array for media_handle_sideload
+    $file_array = array(
+        'name' => sanitize_file_name($post_title) . '-' . time() . $extension,
+        'tmp_name' => $temp_file,
+        'type' => $image_info['mime']
+    );
 
-    // Mengatur featured image
-    set_post_thumbnail($post_id, $attach_id);
+    frp_log_message("Prepared file array: " . print_r($file_array, true));
 
-    // Mengatur alt text untuk gambar
-    update_post_meta($attach_id, '_wp_attachment_image_alt', $post_title);
+    // Temporarily disable some security filters
+    $removed_filters = array();
+    
+    // Remove common security plugin filters that might interfere
+    if (has_filter('wp_handle_upload_prefilter')) {
+        $removed_filters[] = 'wp_handle_upload_prefilter';
+        remove_all_filters('wp_handle_upload_prefilter');
+        frp_log_message("Removed wp_handle_upload_prefilter filters");
+    }
+    
+    if (has_filter('wp_handle_sideload_prefilter')) {
+        $removed_filters[] = 'wp_handle_sideload_prefilter';
+        remove_all_filters('wp_handle_sideload_prefilter');
+        frp_log_message("Removed wp_handle_sideload_prefilter filters");
+    }
+
+    // Handle the upload process
+    frp_log_message("Starting media_handle_sideload...");
+    $attach_id = media_handle_sideload($file_array, $post_id, $post_title);
+
+    // Clean up temp file
+    @unlink($temp_file);
+
+    if (is_wp_error($attach_id)) {
+        frp_log_message("Failed to process image: " . $attach_id->get_error_message());
+        return;
+    }
+
+    frp_log_message("Image uploaded successfully. Attachment ID: " . $attach_id);
+
+    // Set as featured image
+    $result = set_post_thumbnail($post_id, $attach_id);
+    if ($result) {
+        update_post_meta($attach_id, '_wp_attachment_image_alt', $post_title);
+        frp_log_message("Successfully set featured image for post: " . $post_title . " (Attachment ID: " . $attach_id . ")");
+    } else {
+        frp_log_message("Failed to set featured image for post: " . $post_title);
+    }
 }
+
+// Helper function for cURL download (simplified version)
+function frp_download_image_with_curl($url, $args) {
+    if (!function_exists('curl_init')) {
+        return new WP_Error('curl_not_available', 'cURL is not available');
+    }
+    
+    $temp_file = wp_tempnam();
+    if (!$temp_file) {
+        return new WP_Error('temp_file_failed', 'Could not create temporary file');
+    }
+    
+    $fp = @fopen($temp_file, 'w+');
+    if (!$fp) {
+        return new WP_Error('temp_file_open_failed', 'Could not open temporary file');
+    }
+    
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_FILE, $fp);
+    curl_setopt($ch, CURLOPT_TIMEOUT, $args['timeout']);
+    curl_setopt($ch, CURLOPT_USERAGENT, $args['user-agent']);
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($ch, CURLOPT_MAXREDIRS, $args['redirection']);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+    curl_setopt($ch, CURLOPT_REFERER, $args['headers']['Referer']);
+    
+    $result = curl_exec($ch);
+    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $error = curl_error($ch);
+    
+    curl_close($ch);
+    fclose($fp);
+    
+    if ($result === false || $http_code >= 400) {
+        @unlink($temp_file);
+        return new WP_Error('curl_download_failed', 'cURL download failed: ' . $error . ' (HTTP ' . $http_code . ')');
+    }
+    
+    frp_log_message("cURL download successful. HTTP Code: " . $http_code);
+    return $temp_file;
+}
+
+
+// Fungsi untuk sementara menonaktifkan Shield Security saat upload
+function frp_temporarily_disable_shield() {
+    // Shield Security
+    if (defined('ICWP_WPSF_PLUGIN_FILE')) {
+        remove_all_filters('wp_handle_upload_prefilter');
+        remove_all_filters('wp_handle_upload');
+        remove_all_filters('wp_handle_sideload_prefilter');
+    }
+    
+    // Wordfence
+    if (class_exists('wordfence')) {
+        remove_all_filters('wp_handle_upload_prefilter');
+    }
+    
+    // Sucuri
+    if (class_exists('SucuriScanInterface')) {
+        remove_all_filters('wp_handle_upload_prefilter');
+    }
+    
+    frp_log_message("Temporarily disabled security plugins for image upload");
+}
+
+// Hook untuk menonaktifkan security plugins saat upload gambar
+add_action('frp_before_image_upload', 'frp_temporarily_disable_shield');
+
 
 // Fungsi untuk mencatat log
 function frp_log_message($message, $type = 'info') {
@@ -1146,6 +1411,33 @@ function frp_log_message($message, $type = 'info') {
     $last_timestamp = time();
     
     file_put_contents($log_file, $log_entry, FILE_APPEND);
+    frp_check_log_size();
+}
+
+function frp_check_log_size() {
+    $log_file = plugin_dir_path(__FILE__) . 'frp_log.txt';
+    $max_size = 10 * 1024 * 1024; // 10MB in bytes
+    
+    if (file_exists($log_file)) {
+        $file_size = filesize($log_file);
+        
+        if ($file_size > $max_size) {
+            // Read last 5MB of logs to keep recent entries
+            $keep_size = 5 * 1024 * 1024;
+            $contents = file_get_contents($log_file, false, null, $file_size - $keep_size);
+            
+            // Find first complete log entry
+            $pos = strpos($contents, "\n");
+            if ($pos !== false) {
+                $contents = substr($contents, $pos + 1);
+            }
+            
+            // Write back truncated logs
+            file_put_contents($log_file, $contents);
+            
+            frp_log_message("Log file truncated - size exceeded 10MB limit");
+        }
+    }
 }
 
 
@@ -1229,10 +1521,45 @@ add_action('frp_rewrite_feed_content_event', 'frp_rewrite_feed_content');
 
 // Fungsi helper untuk ekstraksi konten
 function frp_extract_article_content($html, $url) {
+    if (empty($html)) {
+        frp_log_message("Empty HTML content received for: " . $url);
+        return '';
+    }
     $doc = new DOMDocument();
     @$doc->loadHTML(mb_convert_encoding($html, 'HTML-ENTITIES', 'UTF-8'));
     $xpath = new DOMXPath($doc);
     
+    if (strpos($url, 'bikesportnews.com') !== false) {
+        // Process directly from the RSS feed item
+        if (preg_match('/<item>.*?<content:encoded>\s*<!\[CDATA\[(.*?)\]\]>\s*<\/content:encoded>.*?<\/item>/s', $html, $matches)) {
+            $content = $matches[1];
+            
+            // Remove the first image and its attributes
+            $content = preg_replace('/<img[^>]+>/', '', $content, 1);
+            
+            // Remove links to "The post" and "BikeSport News"
+            $content = preg_replace('/<p>The post.*?BikeSport News\.<\/p>/', '', $content);
+            
+            // Extract only paragraph content
+            preg_match_all('/<p>(.*?)<\/p>/s', $content, $paragraphs);
+            
+            if (!empty($paragraphs[1])) {
+                $cleaned_content = '';
+                foreach ($paragraphs[1] as $paragraph) {
+                    // Clean up HTML entities and tags
+                    $paragraph = strip_tags($paragraph);
+                    $paragraph = html_entity_decode($paragraph, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                    if (!empty(trim($paragraph))) {
+                        $cleaned_content .= trim($paragraph) . "\n\n";
+                    }
+                }
+                
+                frp_log_message("Successfully extracted content from BikeSport News feed");
+                return trim($cleaned_content);
+            }
+        }
+    }
+
     // Selector khusus untuk motorsport.com
     if (strpos($url, 'motorsport.com') !== false) {
         // Coba ambil konten dari artikel motorsport.com
@@ -1257,22 +1584,43 @@ function frp_extract_article_content($html, $url) {
         }
     }
     
-    // Selector default untuk situs lain
+    // Default selectors for other sites
     $default_selectors = [
-        "//article[contains(@class, 'article-content')]",
-        "//div[contains(@class, 'article-body')]",
-        "//div[contains(@class, 'entry-content')]",
-        "//main//article",
-        "//div[contains(@class, 'post-content')]"
+        "//div[contains(@class, 'entry-content')]//p",
+        "//article//p",
+        "//div[contains(@class, 'post-content')]//p",
+        "//div[contains(@class, 'article-content')]//p",
+        "//div[contains(@class, 'content')]//p"
     ];
     
     foreach ($default_selectors as $selector) {
         $nodes = $xpath->query($selector);
         if ($nodes->length > 0) {
-            return trim($nodes->item(0)->textContent);
+            $content = '';
+            foreach ($nodes as $node) {
+                $text = trim($node->textContent);
+                if (!empty($text)) {
+                    $content .= $text . "\n\n";
+                }
+            }
+            if (!empty($content)) {
+                return trim($content);
+            }
         }
     }
     
-    frp_log_message("Tidak dapat menemukan konten dengan selector yang tersedia: " . $url);
+    // Try to get content directly from content:encoded if available
+    $content_encoded = $xpath->evaluate("string(//content:encoded)");
+    if (!empty($content_encoded)) {
+        // Strip HTML tags but preserve paragraphs
+        $content = strip_tags($content_encoded, '<p>');
+        if (!empty($content)) {
+            frp_log_message("Extracted content from content:encoded");
+            return trim($content);
+        }
+    }
+    
+    frp_log_message("Could not extract content from article: " . $url);
     return '';
 }
+

@@ -42,11 +42,19 @@ function frp_render_settings_page() {
     ?>
     <div class="wrap">
         <h1>Feed Rewriter Settings</h1>
+        
+        <?php
+        // Tampilkan pesan sukses jika settings disimpan
+        if (isset($_GET['settings-updated']) && $_GET['settings-updated']) {
+            echo '<div class="notice notice-success is-dismissible"><p>Settings saved successfully!</p></div>';
+        }
+        ?>
+        
         <form method="post" action="options.php">
             <?php
             settings_fields('frp_settings_group');
             do_settings_sections('frp_settings');
-            submit_button();
+            submit_button('Save Settings');
             ?>
         </form>
 
@@ -54,11 +62,21 @@ function frp_render_settings_page() {
         <form method="post" action="">
             <?php wp_nonce_field('frp_manual_execution', 'frp_nonce'); ?>
             <input type="submit" name="manual_execute" value="Run Now" class="button button-primary" />
+            <input type="submit" name="clear_lock" value="Clear Lock" class="button button-secondary" style="margin-left: 10px;" />
         </form>
 
         <?php
+        // Handle clear lock
+        if (isset($_POST['clear_lock']) && check_admin_referer('frp_manual_execution', 'frp_nonce')) {
+            delete_transient('frp_cron_running');
+            echo "<div class='notice notice-success'><p>Cron lock cleared successfully!</p></div>";
+        }
+        
         // Cek apakah tombol "Run Now" ditekan
         if (isset($_POST['manual_execute']) && check_admin_referer('frp_manual_execution', 'frp_nonce')) {
+            // Hapus transient sebelum menjalankan
+            delete_transient('frp_cron_running');
+            
             // Langsung jalankan fungsi tanpa mengubah status cron
             frp_log_message("Memulai eksekusi manual...");
             frp_rewrite_feed_content();
@@ -231,8 +249,15 @@ function frp_rewrite_feed_content() {
         // Log URL yang akan diproses
         frp_log_message("Fetching content from feed URL: " . $feed_url);
 
-        // Mengambil konten dari URL feed
-        $response = wp_remote_get($feed_url);
+        // Mengambil konten dari URL feed dengan header yang lebih baik
+        $response = wp_remote_get($feed_url, [
+            'timeout' => 30,
+            'user-agent' => 'Mozilla/5.0 (compatible; WordPress Feed Reader)',
+            'headers' => [
+                'Accept' => 'application/rss+xml, application/xml, text/xml',
+                'Accept-Language' => 'en-US,en;q=0.9',
+            ]
+        ]);
 
         if (is_wp_error($response)) {
             frp_log_message("Error fetching feed: " . $response->get_error_message());
@@ -242,13 +267,80 @@ function frp_rewrite_feed_content() {
         $body = wp_remote_retrieve_body($response);
         frp_log_message("Raw response length: " . strlen($body) . " characters");
 
+        // Cek apakah response adalah HTML bukan XML
+        if (stripos($body, '<!DOCTYPE html>') === 0 || stripos($body, '<html') !== false) {
+            frp_log_message("ERROR: URL returns HTML page, not XML feed. Please check the feed URL.");
+            frp_log_message("Suggested fix: Try using '/feed/' or '/rss/' at the end of the URL");
+            frp_log_message("Current URL: " . $feed_url);
+            
+            // Coba beberapa URL alternatif untuk The Points Guy
+            $alternative_urls = [
+                'https://thepointsguy.com/feed/',
+                'https://thepointsguy.com/rss/',
+                'https://thepointsguy.com/feed.xml',
+                'https://feeds.feedburner.com/ThePointsGuy'
+            ];
+            
+            frp_log_message("Trying alternative feed URLs...");
+            
+            foreach ($alternative_urls as $alt_url) {
+                frp_log_message("Trying: " . $alt_url);
+                
+                $alt_response = wp_remote_get($alt_url, [
+                    'timeout' => 15,
+                    'user-agent' => 'Mozilla/5.0 (compatible; WordPress Feed Reader)',
+                    'headers' => [
+                        'Accept' => 'application/rss+xml, application/xml, text/xml',
+                    ]
+                ]);
+                
+                if (!is_wp_error($alt_response)) {
+                    $alt_body = wp_remote_retrieve_body($alt_response);
+                    
+                    // Cek apakah ini XML feed yang valid
+                    if (stripos($alt_body, '<!DOCTYPE html>') !== 0 && 
+                        (stripos($alt_body, '<rss') !== false || 
+                         stripos($alt_body, '<feed') !== false ||
+                         stripos($alt_body, '<?xml') !== false)) {
+                        
+                        frp_log_message("Found valid feed at: " . $alt_url);
+                        $body = $alt_body;
+                        $feed_url = $alt_url; // Update feed URL untuk processing
+                        break;
+                    }
+                }
+            }
+            
+            // Jika masih HTML setelah mencoba alternatif
+            if (stripos($body, '<!DOCTYPE html>') === 0 || stripos($body, '<html') !== false) {
+                frp_log_message("FAILED: All alternative URLs also return HTML. Please manually check and update the feed URL in settings.");
+                return;
+            }
+        }
+
+        // Bersihkan response body dari karakter yang tidak valid
+        $body = frp_clean_xml_response($body);
+
         try {
-            $xml = new SimpleXMLElement($body);
+            // Ganti bagian parsing XML dengan fungsi yang lebih robust
+            $xml = frp_parse_xml_with_fallback($body);
+            
+            if ($xml === false) {
+                frp_log_message("Failed to parse XML feed after all attempts");
+                
+                // Simpan raw response untuk debugging
+                $debug_log = plugin_dir_path(__FILE__) . 'debug_raw_feed.log';
+                file_put_contents($debug_log, "=== Failed XML Response ===\n" . $body . "\n\n=== Response Headers ===\n" . print_r(wp_remote_retrieve_headers($response), true));
+                
+                return;
+            }
+            
             $article_found = false;
 
             // Deteksi dan proses feed berdasarkan format (RSS atau Atom)
-            if ($xml->channel) {
-                frp_log_message("Detected RSS feed format");
+            if (isset($xml->channel) && isset($xml->channel->item)) {
+                frp_log_message("Detected RSS feed format with " . count($xml->channel->item) . " items");
+                
                 foreach ($xml->channel->item as $item) {
                     $original_title = strip_tags((string)$item->title);
                     $link = (string)$item->link;
@@ -272,6 +364,18 @@ function frp_rewrite_feed_content() {
                         }
                     }
                     
+                    // 3. Coba ambil dari content:encoded (untuk BikeSport News dan feed serupa)
+                    if (empty($image_url)) {
+                        $content_encoded = '';
+                        if (isset($item->children('content', true)->encoded)) {
+                            $content_encoded = (string)$item->children('content', true)->encoded;
+                            if (preg_match('/<img[^>]+src="([^"]+)"/', html_entity_decode($content_encoded), $matches)) {
+                                $image_url = $matches[1];
+                                frp_log_message("Image found from content:encoded: " . $image_url);
+                            }
+                        }
+                    }
+                    
                     // Bersihkan URL gambar dari karakter HTML entities
                     if (!empty($image_url)) {
                         $image_url = html_entity_decode($image_url);
@@ -280,23 +384,70 @@ function frp_rewrite_feed_content() {
                         frp_log_message("Final cleaned image URL: " . $image_url);
                     }
 
-                    // Ambil deskripsi tanpa tag HTML
-                    $description = strip_tags(html_entity_decode((string)$item->description));
+                    // Ambil konten - prioritaskan content:encoded untuk feed yang memilikinya
+                    $content = '';
                     
-                    // Ambil content:encoded jika ada
-                    $content_encoded = '';
+                    // 1. Cek content:encoded terlebih dahulu (untuk BikeSport News)
                     if (isset($item->children('content', true)->encoded)) {
-                        $content_encoded = strip_tags(html_entity_decode((string)$item->children('content', true)->encoded));
+                        $content_encoded = (string)$item->children('content', true)->encoded;
+                        if (!empty($content_encoded)) {
+                            // Bersihkan HTML dan ambil teks
+                            $content = strip_tags(html_entity_decode($content_encoded));
+                            // Hapus bagian "The post ... appeared first on ..." di akhir
+                            $content = preg_replace('/The post .* appeared first on .*\./s', '', $content);
+                            $content = trim($content);
+                            frp_log_message("Content extracted from content:encoded. Length: " . strlen($content));
+                        }
+                    }
+                    
+                    // 2. Jika tidak ada content:encoded atau kosong, gunakan description
+                    if (empty($content)) {
+                        $description = strip_tags(html_entity_decode((string)$item->description));
+                        // Hapus bagian "The post ... appeared first on ..." di akhir
+                        $description = preg_replace('/The post .* appeared first on .*\./s', '', $description);
+                        $content = trim($description);
+                        frp_log_message("Content extracted from description. Length: " . strlen($content));
                     }
 
                     frp_log_message("Processing article: {$original_title}");
-                    frp_log_message("Description length: " . strlen($description));
-                    if (!empty($content_encoded)) {
-                        frp_log_message("Content:encoded length: " . strlen($content_encoded));
+                    frp_log_message("Content length: " . strlen($content));
+                    
+                    // Jika konten masih kosong atau terlalu pendek, coba ambil dari URL artikel
+                    if (empty($content) || strlen($content) < 100) {
+                        frp_log_message("Content too short, fetching from article URL: " . $link);
+                        
+                        $article_response = wp_remote_get($link, [
+                            'timeout' => 30,
+                            'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                            'headers' => [
+                                'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                                'Accept-Language' => 'en-US,en;q=0.5',
+                            ]
+                        ]);
+                        
+                        if (!is_wp_error($article_response)) {
+                            $article_html = wp_remote_retrieve_body($article_response);
+                            
+                            // Ekstraksi konten khusus untuk BikeSport News
+                            if (strpos($link, 'bikesportnews.com') !== false) {
+                                $extracted_content = frp_extract_bikesport_content($article_html);
+                                if (!empty($extracted_content)) {
+                                    $content = $extracted_content;
+                                    frp_log_message("Content extracted from BikeSport News article. Length: " . strlen($content));
+                                }
+                            } else {
+                                // Gunakan ekstraksi umum untuk situs lain
+                                $extracted_content = frp_extract_article_content($article_html, $link);
+                                if (!empty($extracted_content)) {
+                                    $content = $extracted_content;
+                                    frp_log_message("Content extracted from article URL. Length: " . strlen($content));
+                                }
+                            }
+                        }
                     }
                     
-                    // Jika masih tidak ada, baru coba ambil dari konten artikel
-                    if (empty($image_url)) {
+                    // Jika masih tidak ada gambar, coba ambil dari konten artikel
+                    if (empty($image_url) && !empty($content)) {
                         $article_response = wp_remote_get($link);
                         if (!is_wp_error($article_response)) {
                             $article_html = wp_remote_retrieve_body($article_response);
@@ -304,43 +455,12 @@ function frp_rewrite_feed_content() {
                         }
                     }
 
-                    frp_log_message("Image URL found: " . $image_url);
-        
-
-                    frp_log_message("Processing article: {$original_title}");
-                    
-                    // Ambil konten lengkap dari URL artikel
-                    frp_log_message("Fetching full article content from: " . $link);
-                    
-                    $article_response = wp_remote_get($link, [
-                        'timeout' => 30,
-                        'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                        'headers' => [
-                            'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                            'Accept-Language' => 'en-US,en;q=0.5',
-                        ]
-                    ]);
-                    
-                    if (is_wp_error($article_response)) {
-                        frp_log_message("Error mengambil konten artikel: " . $article_response->get_error_message());
-                        continue;
-                    }
-            
-                    $article_html = wp_remote_retrieve_body($article_response);
-                    // Tambahkan ekstraksi konten khusus untuk CNN Indonesia
-                    $content = '';
-                    if (strpos($link, 'cnnindonesia.com') !== false) {
-                        $content = frp_extract_cnn_content($article_html);
-                    } else {
-                        $content = frp_extract_article_content($article_html, $link);
-                    }
-            
                     if (empty($content)) {
                         frp_log_message("Tidak dapat mengekstrak konten dari artikel: " . $link);
                         continue;
                     }
-            
-                    frp_log_message("Berhasil mengekstrak konten. Panjang: " . strlen($content) . " karakter");
+
+                    frp_log_message("Final content length: " . strlen($content) . " karakter");
                     
                     // Simpan konten mentah untuk debugging
                     $raw_content_log = plugin_dir_path(__FILE__) . 'raw_article_content.log';
@@ -410,7 +530,7 @@ function frp_rewrite_feed_content() {
                                 frp_set_featured_image($post_id, $image_url, $new_title_and_content['title'], $content);
                             }
 
-                            // Generate dan set tags
+                                                        // Generate dan set tags
                             $tags = frp_generate_tags($new_title_and_content['content']);
                             if ($tags) {
                                 wp_set_post_tags($post_id, $tags);
@@ -430,8 +550,51 @@ function frp_rewrite_feed_content() {
                         frp_log_message("Failed to rewrite content");
                     }
                 }
-            } elseif ($xml->entry) {
-                // ... kode serupa untuk format Atom ...
+            } elseif (isset($xml->entry)) {
+                frp_log_message("Detected Atom feed format with " . count($xml->entry) . " entries");
+                
+                foreach ($xml->entry as $entry) {
+                    $original_title = strip_tags((string)$entry->title);
+                    $link = '';
+                    
+                    // Atom feed bisa punya multiple link elements
+                    if (isset($entry->link)) {
+                        if (is_array($entry->link)) {
+                            foreach ($entry->link as $link_elem) {
+                                if ((string)$link_elem['rel'] === 'alternate' || empty($link)) {
+                                    $link = (string)$link_elem['href'];
+                                    break;
+                                }
+                            }
+                        } else {
+                            $link = (string)$entry->link['href'];
+                        }
+                    }
+                    
+                    if (empty($link)) {
+                        frp_log_message("No valid link found for Atom entry: " . $original_title);
+                        continue;
+                    }
+                    
+                    frp_log_message("Processing Atom entry: " . $original_title);
+                    // Untuk sementara hanya log, bisa dikembangkan lebih lanjut jika diperlukan
+                    break; // Process only one article for now
+                }
+            } else {
+                frp_log_message("ERROR: Feed format not recognized");
+                frp_log_message("Expected RSS (<rss><channel><item>) or Atom (<feed><entry>) structure");
+                
+                // Log struktur XML untuk debugging (batasi output)
+                if (isset($xml->channel)) {
+                    frp_log_message("Found <channel> but no <item> elements");
+                } elseif (isset($xml->feed)) {
+                    frp_log_message("Found <feed> but no <entry> elements");
+                } else {
+                    $xml_structure = print_r($xml, true);
+                    frp_log_message("XML root elements: " . substr($xml_structure, 0, 300) . "...");
+                }
+                
+                return;
             }
 
             if (!$article_found) {
@@ -439,9 +602,11 @@ function frp_rewrite_feed_content() {
             }
 
         } catch (Exception $e) {
-            frp_log_message("Error parsing feed XML: " . $e->getMessage());
+            frp_log_message("Error in XML processing: " . $e->getMessage());
+            
+            // Simpan raw response untuk debugging
             $debug_log = plugin_dir_path(__FILE__) . 'debug_raw_feed.log';
-            file_put_contents($debug_log, $body);
+            file_put_contents($debug_log, "=== Exception in XML Processing ===\n" . $e->getMessage() . "\n\n=== Raw Response ===\n" . $body);
         }
 
         // Setelah berhasil memproses satu artikel
@@ -462,6 +627,238 @@ function frp_rewrite_feed_content() {
     if (!$is_manual) {
         frp_check_cron_status();
     }
+}
+
+
+// Fungsi untuk membersihkan XML response
+function frp_clean_xml_response($xml_string) {
+    // Hapus BOM (Byte Order Mark) jika ada
+    $xml_string = preg_replace('/^\xEF\xBB\xBF/', '', $xml_string);
+    
+    // Hapus karakter kontrol yang tidak valid dalam XML
+    $xml_string = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', '', $xml_string);
+    
+    // Hapus whitespace di awal dan akhir
+    $xml_string = trim($xml_string);
+    
+    // Cek apakah string dimulai dengan <?xml atau langsung dengan tag root
+    if (!preg_match('/^\s*<\?xml/', $xml_string) && !preg_match('/^\s*<(rss|feed|rdf)/', $xml_string)) {
+        frp_log_message("Response doesn't appear to be valid XML. First 200 chars: " . substr($xml_string, 0, 200));
+        
+        // Coba cari tag XML di dalam response
+        if (preg_match('/<\?xml.*?>/s', $xml_string, $matches, PREG_OFFSET_CAPTURE)) {
+            $xml_start = $matches[0][1];
+            $xml_string = substr($xml_string, $xml_start);
+            frp_log_message("Found XML declaration at position " . $xml_start . ", extracting from there");
+        } elseif (preg_match('/<(rss|feed|rdf)[^>]*>/s', $xml_string, $matches, PREG_OFFSET_CAPTURE)) {
+            $xml_start = $matches[0][1];
+            $xml_string = substr($xml_string, $xml_start);
+            frp_log_message("Found root XML tag at position " . $xml_start . ", extracting from there");
+        }
+    }
+    
+    // Perbaiki encoding issues
+    if (!mb_check_encoding($xml_string, 'UTF-8')) {
+        $xml_string = mb_convert_encoding($xml_string, 'UTF-8', 'auto');
+        frp_log_message("Converted XML encoding to UTF-8");
+    }
+    
+    // Escape karakter HTML entities yang bermasalah dalam XML
+    $xml_string = preg_replace('/&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)/', '&amp;', $xml_string);
+    
+    return $xml_string;
+}
+
+// Fungsi untuk validasi dan fallback parsing XML
+function frp_parse_xml_with_fallback($xml_string) {
+    // Coba parsing normal terlebih dahulu
+    libxml_use_internal_errors(true);
+    libxml_clear_errors();
+    
+    try {
+        $xml = new SimpleXMLElement($xml_string);
+        frp_log_message("XML parsed successfully with SimpleXMLElement");
+        return $xml;
+    } catch (Exception $e) {
+        frp_log_message("SimpleXMLElement failed: " . $e->getMessage());
+        
+        // Log libxml errors
+        $xml_errors = libxml_get_errors();
+        if (!empty($xml_errors)) {
+            foreach ($xml_errors as $error) {
+                frp_log_message("XML Parse Error: " . trim($error->message) . " at line " . $error->line . ", column " . $error->column);
+            }
+        }
+        
+        // Coba dengan DOMDocument sebagai fallback
+        try {
+            $dom = new DOMDocument();
+            $dom->recover = true;
+            $dom->strictErrorChecking = false;
+            
+            if ($dom->loadXML($xml_string)) {
+                $xml = simplexml_import_dom($dom);
+                if ($xml !== false) {
+                    frp_log_message("XML parsed successfully with DOMDocument fallback");
+                    return $xml;
+                }
+            }
+        } catch (Exception $dom_e) {
+            frp_log_message("DOMDocument fallback also failed: " . $dom_e->getMessage());
+        }
+        
+        // Jika masih gagal, coba bersihkan XML lebih agresif
+        frp_log_message("Attempting aggressive XML cleanup");
+        $cleaned_xml = frp_aggressive_xml_cleanup($xml_string);
+        
+        try {
+            $xml = new SimpleXMLElement($cleaned_xml);
+            frp_log_message("XML parsed successfully after aggressive cleanup");
+            return $xml;
+        } catch (Exception $final_e) {
+            frp_log_message("All XML parsing attempts failed: " . $final_e->getMessage());
+            return false;
+        }
+    }
+}
+
+// Fungsi untuk pembersihan XML yang lebih agresif
+function frp_aggressive_xml_cleanup($xml_string) {
+    // Hapus semua yang ada sebelum deklarasi XML atau tag root
+    if (preg_match('/<\?xml.*?\?>/s', $xml_string, $matches, PREG_OFFSET_CAPTURE)) {
+        $xml_string = substr($xml_string, $matches[0][1]);
+    } elseif (preg_match('/<(rss|feed|rdf)[^>]*>/s', $xml_string, $matches, PREG_OFFSET_CAPTURE)) {
+        $xml_string = substr($xml_string, $matches[0][1]);
+    }
+    
+    // Hapus JavaScript dan CSS yang mungkin ada
+    $xml_string = preg_replace('/<script[^>]*>.*?<\/script>/is', '', $xml_string);
+    $xml_string = preg_replace('/<style[^>]*>.*?<\/style>/is', '', $xml_string);
+    
+    // Hapus komentar HTML
+    $xml_string = preg_replace('/<!--.*?-->/s', '', $xml_string);
+    
+    // Perbaiki tag yang tidak tertutup dengan benar
+    $xml_string = preg_replace('/<([^>]+)>([^<]*)<\/\1>/s', '<$1><![CDATA[$2]]></$1>', $xml_string);
+    
+    // Hapus karakter yang tidak valid untuk XML
+    $xml_string = preg_replace('/[^\x09\x0A\x0D\x20-\x7E\x85\xA0-\xFF]/', '', $xml_string);
+    
+    return $xml_string;
+}
+
+// Tambahkan fungsi khusus untuk mengekstrak konten BikeSport News
+function frp_extract_bikesport_content($html) {
+    $doc = new DOMDocument();
+    @$doc->loadHTML(mb_convert_encoding($html, 'HTML-ENTITIES', 'UTF-8'));
+    $xpath = new DOMXPath($doc);
+    
+    // Selector khusus untuk BikeSport News
+    $selectors = [
+        "//div[contains(@class, 'entry-content')]//p",
+        "//article[contains(@class, 'post')]//p",
+        "//div[contains(@class, 'post-content')]//p",
+        "//div[contains(@class, 'content')]//p"
+    ];
+    
+    foreach ($selectors as $selector) {
+        $nodes = $xpath->query($selector);
+        if ($nodes->length > 0) {
+            $content = '';
+            foreach ($nodes as $node) {
+                // Skip jika paragraf kosong atau hanya berisi spasi
+                $text = trim($node->textContent);
+                if (!empty($text) && 
+                    !preg_match('/^(The post|Share this:|Tags:|Categories:)/i', $text) &&
+                    !preg_match('/appeared first on/i', $text)) {
+                    $content .= $text . "\n\n";
+                }
+            }
+            
+            if (!empty($content)) {
+                frp_log_message("Berhasil mengekstrak konten BikeSport News");
+                return trim($content);
+            }
+        }
+    }
+    
+    frp_log_message("Gagal mengekstrak konten BikeSport News dengan selector yang tersedia");
+    return '';
+}
+
+// Tambahkan fungsi khusus untuk mengekstrak konten The Points Guy
+function frp_extract_tpg_content($html) {
+    $doc = new DOMDocument();
+    @$doc->loadHTML(mb_convert_encoding($html, 'HTML-ENTITIES', 'UTF-8'));
+    $xpath = new DOMXPath($doc);
+    
+    // Selector khusus untuk The Points Guy
+    $selectors = [
+        "//div[contains(@class, 'post-content')]",
+        "//div[contains(@class, 'entry-content')]",
+        "//article[contains(@class, 'post')]//div[contains(@class, 'content')]",
+        "//main//article//div[contains(@class, 'post-body')]",
+        "//div[contains(@class, 'article-content')]",
+        "//div[contains(@class, 'post-body')]"
+    ];
+    
+    foreach ($selectors as $selector) {
+        $nodes = $xpath->query($selector);
+        if ($nodes->length > 0) {
+            $content = '';
+            foreach ($nodes as $node) {
+                // Ambil semua paragraf dalam node
+                $paragraphs = $xpath->query('.//p', $node);
+                if ($paragraphs->length > 0) {
+                    foreach ($paragraphs as $p) {
+                        $text = trim($p->textContent);
+                        if (!empty($text) && strlen($text) > 20) { // Skip paragraf yang terlalu pendek
+                            $content .= $text . "\n\n";
+                        }
+                    }
+                } else {
+                    // Jika tidak ada paragraf, ambil text content langsung
+                    $text = trim($node->textContent);
+                    if (!empty($text)) {
+                        $content .= $text . "\n\n";
+                    }
+                }
+            }
+            
+            if (!empty($content) && strlen($content) > 200) {
+                frp_log_message("Berhasil mengekstrak konten The Points Guy");
+                return trim($content);
+            }
+        }
+    }
+    
+    // Fallback: coba ambil semua paragraf di dalam article atau main
+    $fallback_selectors = [
+        "//article//p",
+        "//main//p",
+        "//div[contains(@id, 'content')]//p"
+    ];
+    
+    foreach ($fallback_selectors as $selector) {
+        $paragraphs = $xpath->query($selector);
+        if ($paragraphs->length > 3) { // Minimal 3 paragraf
+            $content = '';
+            foreach ($paragraphs as $p) {
+                $text = trim($p->textContent);
+                if (!empty($text) && strlen($text) > 20) {
+                    $content .= $text . "\n\n";
+                }
+            }
+            
+            if (strlen($content) > 500) {
+                frp_log_message("Berhasil mengekstrak konten TPG dengan fallback selector");
+                return trim($content);
+            }
+        }
+    }
+    
+    frp_log_message("Gagal mengekstrak konten The Points Guy dengan selector yang tersedia");
+    return '';
 }
 
 // hook untuk mengecek status cron secara berkala
@@ -600,8 +997,16 @@ function frp_display_generated_articles($max_posts = 20) {
 
 // Mendaftarkan pengaturan
 function frp_register_settings() {
-    register_setting('frp_settings_group', 'frp_api_key');
-    register_setting('frp_settings_group', 'frp_feed_url');
+    register_setting('frp_settings_group', 'frp_api_key', [
+        'type' => 'string', 
+        'sanitize_callback' => 'sanitize_text_field',
+        'default' => ''
+    ]);
+    register_setting('frp_settings_group', 'frp_feed_url', [
+        'type' => 'string',
+        'sanitize_callback' => 'sanitize_textarea_field',
+        'default' => ''
+    ]);
     register_setting('frp_settings_group', 'frp_image_selector');    
     register_setting('frp_settings_group', 'frp_keyword_filter');
     register_setting('frp_settings_group', 'frp_exclude_keyword_filter');
@@ -829,8 +1234,13 @@ function frp_language_callback() {
 
 function frp_feed_url_callback() {
     $feed_url = get_option('frp_feed_url', '');
-    echo "<textarea name='frp_feed_url' rows='5' style='width: 100%;'>" . esc_textarea($feed_url) . "</textarea>";
+    echo "<textarea name='frp_feed_url' rows='5' style='width: 100%; max-width: 600px;'>" . esc_textarea($feed_url) . "</textarea>";
     echo "<p class='description'>Masukkan URL feed, satu URL per baris</p>";
+    
+    // Debug: tampilkan nilai saat ini
+    if (!empty($feed_url)) {
+        echo "<p><small><strong>Current value:</strong> " . esc_html($feed_url) . "</small></p>";
+    }
 }
 
 function frp_api_key_callback() {
@@ -855,6 +1265,7 @@ function frp_model_callback() {
             <option value='gpt-3.5-turbo' " . selected($model, 'gpt-3.5-turbo', false) . ">GPT-3.5 Turbo</option>
             <option value='gpt-4' " . selected($model, 'gpt-4', false) . ">GPT-4</option>
             <option value='gpt-4o-mini' " . selected($model, 'gpt-4o-mini', false) . ">gpt-4o-mini</option>
+            <option value='gpt-4.1-nano' " . selected($model, 'gpt-4.1-nano', false) . ">gpt-4.1-nano</option>
           </select>";
 }
 
@@ -976,13 +1387,57 @@ function frp_rewrite_title_and_content($title, $content) {
 
     $body = json_decode(wp_remote_retrieve_body($response), true);
     if (isset($body['choices'][0]['message']['content'])) {
-        $generated_text = explode("\n\n", $body['choices'][0]['message']['content'], 2);
+        $generated_text = $body['choices'][0]['message']['content'];
         
-        // Bersihkan judul dari karakter yang tidak diinginkan
-        $cleaned_title = frp_clean_text(trim($generated_text[0]), true);
+        // Split berdasarkan double newline untuk memisahkan title dan content
+        $parts = explode("\n\n", $generated_text, 2);
+        
+        // Ambil bagian pertama sebagai title
+        $raw_title = trim($parts[0]);
+        
+        // Bersihkan title dari berbagai prefix yang mungkin muncul
+        $title_prefixes = [
+            '### Title:',
+            '## Title:',
+            '# Title:',
+            'Title:',
+            'TITLE:',
+            '### Judul:',
+            '## Judul:',
+            '# Judul:',
+            'Judul:',
+            'JUDUL:'
+        ];
+        
+        foreach ($title_prefixes as $prefix) {
+            if (stripos($raw_title, $prefix) === 0) {
+                $raw_title = trim(substr($raw_title, strlen($prefix)));
+                break;
+            }
+        }
+        
+        // Bersihkan title dari karakter markdown lainnya
+        $raw_title = preg_replace('/^#+\s*/', '', $raw_title); // Hapus # di awal
+        $raw_title = preg_replace('/^\*+\s*/', '', $raw_title); // Hapus * di awal
+        $raw_title = trim($raw_title);
+        
+        // Ambil bagian kedua sebagai content (jika ada)
+        $raw_content = isset($parts[1]) ? trim($parts[1]) : '';
+        
+        // Jika tidak ada content terpisah, coba split dengan newline tunggal
+        if (empty($raw_content)) {
+            $single_parts = explode("\n", $generated_text, 2);
+            if (count($single_parts) > 1) {
+                $raw_content = trim($single_parts[1]);
+            }
+        }
+        
+        // Bersihkan judul dan konten
+        $cleaned_title = frp_clean_text($raw_title, true);
+        $cleaned_content = frp_clean_text($raw_content, false);
 
-        // Bersihkan konten dan buat TOC
-        $cleaned_content = frp_clean_text(trim($generated_text[1] ?? ''), false);
+        frp_log_message("Original generated title: " . $raw_title);
+        frp_log_message("Cleaned title: " . $cleaned_title);
 
         return [
             'title' => $cleaned_title,
@@ -994,19 +1449,36 @@ function frp_rewrite_title_and_content($title, $content) {
     }
 }
 
-
 // Fungsi untuk membersihkan teks dari karakter yang tidak diinginkan
 function frp_clean_text($text, $is_title = false) {
     if ($is_title) {
-        // Menghapus kata "Judul" dari title
-        $text = preg_replace('/\bJudul\b/i', '', $text); 
-        // Membersihkan karakter aneh pada judul
-        $text = preg_replace('/[^a-zA-Z0-9\s\p{L}]/u', '', $text); // Menghapus karakter selain huruf, angka, dan spasi
-        $text = trim($text); // Menghapus spasi berlebihan
+        // Hapus berbagai prefix yang mungkin muncul di title
+        $title_patterns = [
+            '/^(###?\s*)?Title:\s*/i',
+            '/^(###?\s*)?Judul:\s*/i',
+            '/^#+\s*/',  // Hapus markdown headers
+            '/^\*+\s*/', // Hapus bullet points
+            '/^-+\s*/',  // Hapus dashes
+        ];
+        
+        foreach ($title_patterns as $pattern) {
+            $text = preg_replace($pattern, '', $text);
+        }
+        
+        // Hapus quotes di awal dan akhir jika ada
+        $text = trim($text, '"\'');
+        
+        // Hapus karakter yang tidak diinginkan tapi pertahankan karakter khusus yang valid
+        $text = preg_replace('/[^\p{L}\p{N}\s\-\?\!\.\,\:\;\(\)]/u', '', $text);
+        
+        // Bersihkan spasi berlebihan
+        $text = preg_replace('/\s+/', ' ', $text);
+        $text = trim($text);
+        
         return $text;
     } else {
-        // Menghapus kata "Konten:" atau "Isi:" dari awal konten
-        $text = preg_replace('/^(Konten:|Isi:)\s*/i', '', $text);
+        // Untuk content, hapus prefix "Content:" atau "Isi:"
+        $text = preg_replace('/^(###?\s*)?(Content|Isi|Konten):\s*/i', '', $text);
 
         // Mengubah format `### Kalimat` menjadi `<h2>Kalimat</h2>`
         $text = preg_replace('/^###\s*(.*)$/m', '<h2>$1</h2>', $text);
@@ -1055,11 +1527,76 @@ function frp_clean_text($text, $is_title = false) {
     }
 }
 
-// Modifikasi fungsi ekstraksi gambar
+
+// Fungsi untuk generate Table of Contents
+function frp_generate_toc($content) {
+    preg_match_all('/<h([2-3])[^>]*>(.*?)<\/h[2-3]>/i', $content, $matches, PREG_SET_ORDER);
+    
+    if (empty($matches)) {
+        return $content;
+    }
+    
+    $toc = '<div class="frp-toc"><h3>Table of Contents</h3><ul>';
+    $updated_content = $content;
+    
+    foreach ($matches as $match) {
+        $level = $match[1];
+        $heading_text = strip_tags($match[2]);
+        $slug = sanitize_title_with_dashes($heading_text);
+        
+        // Add TOC item
+        $indent = $level == '3' ? 'style="margin-left: 20px;"' : '';
+        $toc .= '<li ' . $indent . '><a href="#' . $slug . '">' . $heading_text . '</a></li>';
+        
+        // Add ID to heading in content
+        $old_heading = $match[0];
+        $new_heading = '<h' . $level . ' id="' . $slug . '">' . $match[2] . '</h' . $level . '>';
+        $updated_content = str_replace($old_heading, $new_heading, $updated_content);
+    }
+    
+    $toc .= '</ul></div>';
+    
+    // Insert TOC after first paragraph
+    $paragraphs = explode('</p>', $updated_content, 2);
+    if (count($paragraphs) > 1) {
+        return $paragraphs[0] . '</p>' . $toc . $paragraphs[1];
+    }
+    
+    return $toc . $updated_content;
+}
+
+// Update fungsi frp_extract_article_image untuk menangani gambar TPG dengan lebih baik
 function frp_extract_article_image($html, $url) {
     $doc = new DOMDocument();
     @$doc->loadHTML(mb_convert_encoding($html, 'HTML-ENTITIES', 'UTF-8'));
     $xpath = new DOMXPath($doc);
+    
+    // Selector khusus untuk The Points Guy
+    if (strpos($url, 'thepointsguy.com') !== false) {
+        $tpg_selectors = [
+            "//meta[@property='og:image']/@content",
+            "//div[contains(@class, 'wp-caption')]//img/@src",
+            "//figure[contains(@class, 'wp-caption')]//img/@src",
+            "//div[contains(@class, 'post-content')]//img[1]/@src",
+            "//article//img[contains(@class, 'wp-image')]/@src",
+            "//div[contains(@class, 'entry-content')]//img[1]/@src"
+        ];
+        
+        foreach ($tpg_selectors as $selector) {
+            $images = $xpath->query($selector);
+            if ($images->length > 0) {
+                $image_url = $images->item(0)->value;
+                // Pastikan URL gambar valid dan bukan placeholder
+                if (!empty($image_url) && 
+                    !strpos($image_url, 'placeholder') && 
+                    !strpos($image_url, 'default') &&
+                    (strpos($image_url, '.jpg') || strpos($image_url, '.jpeg') || strpos($image_url, '.png') || strpos($image_url, '.webp'))) {
+                    frp_log_message("TPG image found with selector: " . $selector);
+                    return $image_url;
+                }
+            }
+        }
+    }
     
     // Ambil selector kustom dari pengaturan
     $custom_selector = get_option('frp_image_selector', '');
@@ -1073,10 +1610,10 @@ function frp_extract_article_image($html, $url) {
             $xpath_selector = strtr($selector, [
                 '.' => "//*[contains(@class, '",
                 '#' => "//*[@id='",
-                ' ' => "']//",
+                ' ' => "')]//",
                 '[' => "'][@",
                 ']' => "]"
-            ]) . "']//img";
+            ]) . "')]//img";
             
             $images = $xpath->query($xpath_selector);
             if ($images->length > 0) {
@@ -1090,39 +1627,58 @@ function frp_extract_article_image($html, $url) {
         "//meta[@property='og:image']/@content",
         "//article//img[1]/@src",
         "//div[contains(@class, 'entry-content')]//img[1]/@src",
-        "//div[contains(@class, 'post-content')]//img[1]/@src"
+        "//div[contains(@class, 'post-content')]//img[1]/@src",
+        "//main//img[1]/@src"
     ];
     
     foreach ($default_selectors as $selector) {
         $images = $xpath->query($selector);
         if ($images->length > 0) {
-            return $images->item(0)->value;
+            $image_url = $images->item(0)->value;
+            if (!empty($image_url)) {
+                return $image_url;
+            }
         }
     }
     
+    frp_log_message("No image found for URL: " . $url);
     return '';
 }
 
-// Fungsi untuk mengatur featured image dengan nama file dan alt berdasarkan judul
+// Update fungsi frp_set_featured_image untuk menangani gambar TPG dengan lebih baik
 function frp_set_featured_image($post_id, $image_url, $post_title, $content) {
-    if (empty($image_url)) {
-        frp_log_message("No image URL provided for featured image");
+    // Validasi URL gambar terlebih dahulu
+    $validated_url = frp_validate_image_url($image_url);
+    if (!$validated_url) {
+        frp_log_message("Image URL validation failed: " . $image_url);
         return;
     }
-
+    
+    $image_url = $validated_url;
     frp_log_message("Attempting to set featured image from URL: " . $image_url);
 
     // Bersihkan URL gambar
     $image_url = html_entity_decode($image_url);
     
-    // Tambahkan konteks stream untuk HTTPS
+    // Untuk gambar TPG, pastikan menggunakan URL yang optimal
+    if (strpos($image_url, 'thepointsguy.freetls.fastly.net') !== false) {
+        // Tambahkan parameter untuk optimasi gambar jika belum ada
+        if (strpos($image_url, '?') === false) {
+            $image_url .= '?fit=1280,960';
+        }
+    }
+    
+    // Tambahkan konteks stream untuk HTTPS dengan user agent yang lebih baik
     $context = stream_context_create([
         'ssl' => [
             'verify_peer' => false,
             'verify_peer_name' => false,
         ],
         'http' => [
-            'user_agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'user_agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'timeout' => 30,
+            'follow_location' => true,
+            'max_redirects' => 5
         ]
     ]);
 
@@ -1131,7 +1687,13 @@ function frp_set_featured_image($post_id, $image_url, $post_title, $content) {
 
     if ($image_data === false) {
         frp_log_message("Failed to download image from URL: " . $image_url);
-        return;
+        
+        // Coba dengan cURL sebagai fallback
+        $image_data = frp_download_image_with_curl($image_url);
+        if ($image_data === false) {
+            frp_log_message("cURL fallback also failed for image: " . $image_url);
+            return;
+        }
     }
 
     $upload_dir = wp_upload_dir();
@@ -1139,7 +1701,26 @@ function frp_set_featured_image($post_id, $image_url, $post_title, $content) {
     // Dapatkan ekstensi file dari URL
     $file_extension = pathinfo(parse_url($image_url, PHP_URL_PATH), PATHINFO_EXTENSION);
     if (empty($file_extension)) {
-        $file_extension = 'jpg'; // default to jpg if no extension found
+        // Deteksi dari content type jika memungkinkan
+        $finfo = new finfo(FILEINFO_MIME_TYPE);
+        $mime_type = $finfo->buffer($image_data);
+        
+        switch ($mime_type) {
+            case 'image/jpeg':
+                $file_extension = 'jpg';
+                break;
+            case 'image/png':
+                $file_extension = 'png';
+                break;
+            case 'image/gif':
+                $file_extension = 'gif';
+                break;
+            case 'image/webp':
+                $file_extension = 'webp';
+                break;
+            default:
+                $file_extension = 'jpg'; // default fallback
+        }
     }
 
     // Buat nama file yang aman
@@ -1177,6 +1758,67 @@ function frp_set_featured_image($post_id, $image_url, $post_title, $content) {
     } else {
         frp_log_message("Failed to save image file");
     }
+}
+
+// Fungsi fallback untuk download gambar menggunakan cURL
+function frp_download_image_with_curl($image_url) {
+    if (!function_exists('curl_init')) {
+        frp_log_message("cURL not available");
+        return false;
+    }
+    
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $image_url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($ch, CURLOPT_MAXREDIRS, 5);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+    curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        'Accept: image/webp,image/apng,image/*,*/*;q=0.8',
+        'Accept-Language: en-US,en;q=0.9',
+        'Cache-Control: no-cache',
+        'Pragma: no-cache'
+    ]);
+    
+    $image_data = curl_exec($ch);
+    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $error = curl_error($ch);
+    curl_close($ch);
+    
+    if ($image_data === false || $http_code >= 400) {
+        frp_log_message("cURL download failed. HTTP Code: " . $http_code . ", Error: " . $error);
+        return false;
+    }
+    
+    frp_log_message("cURL download successful. HTTP Code: " . $http_code);
+    return $image_data;
+}
+
+// Fungsi untuk membersihkan konten dari feed sebelum dikirim ke OpenAI
+function frp_clean_feed_content($content) {
+    // Hapus shortcode WordPress yang mungkin ada
+    $content = preg_replace('/\[.*?\]/', '', $content);
+    
+    // Hapus link yang berlebihan
+    $content = preg_replace('/\bhttps?:\/\/[^\s]+/i', '', $content);
+    
+    // Hapus referensi ke gambar atau caption
+    $content = preg_replace('/\b(image|photo|picture|caption|credit|getty images|shutterstock)\b/i', '', $content);
+    
+    // Hapus karakter HTML entities yang tersisa
+    $content = html_entity_decode($content, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    
+    // Hapus multiple spaces dan newlines
+    $content = preg_replace('/\s+/', ' ', $content);
+    $content = preg_replace('/\n+/', "\n", $content);
+    
+    // Trim whitespace
+    $content = trim($content);
+    
+    return $content;
 }
 
 // Fungsi untuk mencatat log
@@ -1270,25 +1912,19 @@ add_action('wp', 'frp_schedule_feed_rewrite');
 // Hubungkan dengan fungsi utama
 add_action('frp_rewrite_feed_content_event', 'frp_rewrite_feed_content');
 
-// // Hapus jadwal saat plugin dinonaktifkan
-// function frp_deactivate_plugin() {
-//     $timestamp = wp_next_scheduled('frp_rewrite_feed_content_event');
-//     if ($timestamp) {
-//         wp_unschedule_event($timestamp, 'frp_rewrite_feed_content_event');
-//     }
-//     frp_log_message("Cron job unscheduled upon plugin deactivation.");
-// }
-// register_deactivation_hook(__FILE__, 'frp_deactivate_plugin');
-
-// Fungsi helper untuk ekstraksi konten
+// Update fungsi frp_extract_article_content untuk menangani TPG dengan lebih baik
 function frp_extract_article_content($html, $url) {
     $doc = new DOMDocument();
     @$doc->loadHTML(mb_convert_encoding($html, 'HTML-ENTITIES', 'UTF-8'));
     $xpath = new DOMXPath($doc);
     
+    // Selector khusus untuk The Points Guy
+    if (strpos($url, 'thepointsguy.com') !== false) {
+        return frp_extract_tpg_content($html);
+    }
+    
     // Selector khusus untuk motorsport.com
     if (strpos($url, 'motorsport.com') !== false) {
-        // Coba ambil konten dari artikel motorsport.com
         $selectors = [
             "//div[contains(@class, 'ms-article-content')]//p",
             "//div[contains(@class, 'text-content')]//p",
@@ -1303,7 +1939,7 @@ function frp_extract_article_content($html, $url) {
                     $content .= $p->textContent . "\n\n";
                 }
                 if (!empty($content)) {
-                    frp_log_message("Berhasil mengekstrak konten");
+                    frp_log_message("Berhasil mengekstrak konten motorsport.com");
                     return trim($content);
                 }
             }
@@ -1316,13 +1952,24 @@ function frp_extract_article_content($html, $url) {
         "//div[contains(@class, 'article-body')]",
         "//div[contains(@class, 'entry-content')]",
         "//main//article",
-        "//div[contains(@class, 'post-content')]"
+        "//div[contains(@class, 'post-content')]",
+        "//div[contains(@class, 'content')]//p"
     ];
     
     foreach ($default_selectors as $selector) {
         $nodes = $xpath->query($selector);
         if ($nodes->length > 0) {
-            return trim($nodes->item(0)->textContent);
+            $content = '';
+            foreach ($nodes as $node) {
+                $text = trim($node->textContent);
+                if (!empty($text)) {
+                    $content .= $text . "\n\n";
+                }
+            }
+            if (strlen($content) > 200) {
+                frp_log_message("Content extracted with selector: " . $selector);
+                return trim($content);
+            }
         }
     }
     
@@ -1330,3 +1977,45 @@ function frp_extract_article_content($html, $url) {
     return '';
 }
 
+// Tambahkan fungsi untuk membersihkan dan memvalidasi URL gambar
+function frp_validate_image_url($image_url) {
+    if (empty($image_url)) {
+        return false;
+    }
+    
+    // Bersihkan URL
+    $image_url = html_entity_decode($image_url);
+    $image_url = trim($image_url);
+    
+    // Pastikan URL valid
+    if (!filter_var($image_url, FILTER_VALIDATE_URL)) {
+        frp_log_message("Invalid image URL: " . $image_url);
+        return false;
+    }
+    
+    // Cek ekstensi file gambar
+    $valid_extensions = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
+    $url_parts = parse_url($image_url);
+    $path_info = pathinfo($url_parts['path']);
+    
+    if (isset($path_info['extension'])) {
+        $extension = strtolower($path_info['extension']);
+        if (!in_array($extension, $valid_extensions)) {
+            frp_log_message("Invalid image extension: " . $extension);
+            return false;
+        }
+    }
+    
+    // Cek apakah URL mengandung parameter gambar (untuk URL dinamis)
+    if (strpos($image_url, '?') !== false) {
+        $query_params = parse_url($image_url, PHP_URL_QUERY);
+        if (strpos($query_params, 'fit=') !== false || 
+            strpos($query_params, 'w=') !== false || 
+            strpos($query_params, 'h=') !== false) {
+            // URL dengan parameter resize, kemungkinan valid
+            return $image_url;
+        }
+    }
+    
+    return $image_url;
+}
