@@ -203,419 +203,81 @@ function frp_rewrite_feed_content() {
     
     if (!$is_manual) {
         frp_log_message("Memulai eksekusi cron...");
+    } else {
+        frp_log_message("Memulai eksekusi manual...");
+        delete_transient('frp_cron_running');
+        frp_log_message("Manual execution - bypassing cron lock.");
     }
-    // Cek apakah cron sedang berjalan
-    $cron_running = get_transient('frp_cron_running');
-    if ($cron_running) {
-        frp_log_message("Cron is already running. Skipping this execution.");
-        return;
+    
+    // Cek apakah cron sedang berjalan - SKIP CHECK untuk manual execution
+    if (!$is_manual) {
+        $cron_running = get_transient('frp_cron_running');
+        if ($cron_running) {
+            frp_log_message("Cron is already running. Skipping this execution.");
+            return;
+        }
     }
 
-    // Set flag bahwa cron sedang berjalan (berlaku selama 30 menit)
+    // Set flag bahwa cron sedang berjalan
     set_transient('frp_cron_running', true, 30 * MINUTE_IN_SECONDS);
 
     try {
         $cron_status = get_option('frp_cron_status', 'inactive');
 
-        // Cek status cron
-        if ($cron_status === 'inactive') {
+        // Cek status cron - SKIP untuk manual execution
+        if (!$is_manual && $cron_status === 'inactive') {
             frp_log_message("Cron job tidak dijalankan karena status inactive.");
             delete_transient('frp_cron_running');
             return;
         }
 
-        // Ambil pengaturan
-        $feed_url = get_option('frp_feed_url');
-        $feed_urls = array_filter(array_map('trim', explode("\n", $feed_url)));
-        $article_created = false;
-
-        $fetch_latest_only = get_option('frp_fetch_latest_only', false);
-        $ignore_processed_urls = get_option('frp_ignore_processed_urls', false);
-        $processed_urls = get_option('frp_processed_urls', []);
-        $ignore_no_image = get_option('frp_ignore_no_image', '1');
-        $selected_category = get_option('frp_selected_category');
-        $keyword_filter = get_option('frp_keyword_filter', '');
-        $keywords = array_filter(array_map('trim', explode("\n", $keyword_filter)));
-    
-        $exclude_keyword_filter = get_option('frp_exclude_keyword_filter', '');
-        $last_processed_date = get_option('frp_last_processed_date', '');
-        $exclude_keywords = array_map('trim', explode(',', strtolower($exclude_keyword_filter)));
-
-        if (empty($feed_url)) {
-            frp_log_message("Feed URL is empty. Please set it in the settings.");
-            return;
-        }
-
-        // Log URL yang akan diproses
-        frp_log_message("Fetching content from feed URL: " . $feed_url);
-
-        // Mengambil konten dari URL feed dengan header yang lebih baik
-        $response = wp_remote_get($feed_url, [
-            'timeout' => 30,
-            'user-agent' => 'Mozilla/5.0 (compatible; WordPress Feed Reader)',
-            'headers' => [
-                'Accept' => 'application/rss+xml, application/xml, text/xml',
-                'Accept-Language' => 'en-US,en;q=0.9',
-            ]
-        ]);
-
-        if (is_wp_error($response)) {
-            frp_log_message("Error fetching feed: " . $response->get_error_message());
-            return;
-        }
-
-        $body = wp_remote_retrieve_body($response);
-        frp_log_message("Raw response length: " . strlen($body) . " characters");
-
-        // Cek apakah response adalah HTML bukan XML
-        if (stripos($body, '<!DOCTYPE html>') === 0 || stripos($body, '<html') !== false) {
-            frp_log_message("ERROR: URL returns HTML page, not XML feed. Please check the feed URL.");
-            frp_log_message("Suggested fix: Try using '/feed/' or '/rss/' at the end of the URL");
-            frp_log_message("Current URL: " . $feed_url);
+        // Process each feed configuration
+        for ($config_num = 1; $config_num <= 5; $config_num++) {
+            $feed_url = get_option("frp_feed_url_{$config_num}", '');
             
-            // Coba beberapa URL alternatif untuk The Points Guy
-            $alternative_urls = [
-                'https://thepointsguy.com/feed/',
-                'https://thepointsguy.com/rss/',
-                'https://thepointsguy.com/feed.xml',
-                'https://feeds.feedburner.com/ThePointsGuy'
-            ];
+            // Skip jika feed URL kosong
+            if (empty($feed_url)) {
+                continue;
+            }
             
-            frp_log_message("Trying alternative feed URLs...");
+            $selected_category = get_option("frp_selected_category_{$config_num}", '');
+            $cron_interval = get_option("frp_cron_interval_{$config_num}", 60);
+            $custom_prompt = get_option("frp_custom_prompt_{$config_num}", 'Rewrite the following content:');
             
-            foreach ($alternative_urls as $alt_url) {
-                frp_log_message("Trying: " . $alt_url);
+            frp_log_message("Processing Feed Configuration #{$config_num}");
+            frp_log_message("Feed URL: {$feed_url}");
+            frp_log_message("Category: {$selected_category}");
+            frp_log_message("Interval: {$cron_interval} minutes");
+            
+            // Cek apakah sudah waktunya untuk memproses feed ini
+            $last_run_key = "frp_last_run_config_{$config_num}";
+            $last_run = get_option($last_run_key, 0);
+            $current_time = time();
+            $interval_seconds = $cron_interval * 60;
+            
+            if (!$is_manual && ($current_time - $last_run) < $interval_seconds) {
+                $time_left = $interval_seconds - ($current_time - $last_run);
+                frp_log_message("Config #{$config_num} - Next run in {$time_left} seconds. Skipping.");
+                continue;
+            }
+            
+            // Process this feed configuration
+            $article_found = frp_process_single_feed($feed_url, $selected_category, $custom_prompt, $config_num);
+            
+            if ($article_found) {
+                // Update last run time untuk config ini
+                update_option($last_run_key, $current_time);
+                frp_log_message("Config #{$config_num} - Article processed successfully.");
                 
-                $alt_response = wp_remote_get($alt_url, [
-                    'timeout' => 15,
-                    'user-agent' => 'Mozilla/5.0 (compatible; WordPress Feed Reader)',
-                    'headers' => [
-                        'Accept' => 'application/rss+xml, application/xml, text/xml',
-                    ]
-                ]);
-                
-                if (!is_wp_error($alt_response)) {
-                    $alt_body = wp_remote_retrieve_body($alt_response);
-                    
-                    // Cek apakah ini XML feed yang valid
-                    if (stripos($alt_body, '<!DOCTYPE html>') !== 0 && 
-                        (stripos($alt_body, '<rss') !== false || 
-                         stripos($alt_body, '<feed') !== false ||
-                         stripos($alt_body, '<?xml') !== false)) {
-                        
-                        frp_log_message("Found valid feed at: " . $alt_url);
-                        $body = $alt_body;
-                        $feed_url = $alt_url; // Update feed URL untuk processing
-                        break;
-                    }
+                // Jika manual execution, proses semua feed. Jika cron, proses satu saja per execution
+                if (!$is_manual) {
+                    break;
                 }
             }
-            
-            // Jika masih HTML setelah mencoba alternatif
-            if (stripos($body, '<!DOCTYPE html>') === 0 || stripos($body, '<html') !== false) {
-                frp_log_message("FAILED: All alternative URLs also return HTML. Please manually check and update the feed URL in settings.");
-                return;
-            }
         }
 
-        // Bersihkan response body dari karakter yang tidak valid
-        $body = frp_clean_xml_response($body);
-
-        try {
-            // Ganti bagian parsing XML dengan fungsi yang lebih robust
-            $xml = frp_parse_xml_with_fallback($body);
-            
-            if ($xml === false) {
-                frp_log_message("Failed to parse XML feed after all attempts");
-                
-                // Simpan raw response untuk debugging
-                $debug_log = plugin_dir_path(__FILE__) . 'debug_raw_feed.log';
-                file_put_contents($debug_log, "=== Failed XML Response ===\n" . $body . "\n\n=== Response Headers ===\n" . print_r(wp_remote_retrieve_headers($response), true));
-                
-                return;
-            }
-            
-            $article_found = false;
-
-            // Deteksi dan proses feed berdasarkan format (RSS atau Atom)
-            if (isset($xml->channel) && isset($xml->channel->item)) {
-                frp_log_message("Detected RSS feed format with " . count($xml->channel->item) . " items");
-                
-                foreach ($xml->channel->item as $item) {
-                    $original_title = strip_tags((string)$item->title);
-                    $link = (string)$item->link;
-                    $pub_date = date('Y-m-d H:i:s', strtotime((string)$item->pubDate));
-
-                    // Reset image_url
-                    $image_url = '';
-                    
-                    // 1. Cek enclosure dengan namespace yang benar
-                    if (isset($item->enclosure)) {
-                        $image_url = (string)$item->enclosure['url'];
-                        frp_log_message("Image found from enclosure: " . $image_url);
-                    }
-                    
-                    // 2. Jika tidak ada, coba ambil dari description
-                    if (empty($image_url)) {
-                        $description = (string)$item->description;
-                        if (preg_match('/<img[^>]+src="([^"]+)"/', html_entity_decode($description), $matches)) {
-                            $image_url = $matches[1];
-                            frp_log_message("Image found from description: " . $image_url);
-                        }
-                    }
-                    
-                    // 3. Coba ambil dari content:encoded (untuk BikeSport News dan feed serupa)
-                    if (empty($image_url)) {
-                        $content_encoded = '';
-                        if (isset($item->children('content', true)->encoded)) {
-                            $content_encoded = (string)$item->children('content', true)->encoded;
-                            if (preg_match('/<img[^>]+src="([^"]+)"/', html_entity_decode($content_encoded), $matches)) {
-                                $image_url = $matches[1];
-                                frp_log_message("Image found from content:encoded: " . $image_url);
-                            }
-                        }
-                    }
-                    
-                    // Bersihkan URL gambar dari karakter HTML entities
-                    if (!empty($image_url)) {
-                        $image_url = html_entity_decode($image_url);
-                        // Pastikan URL gambar menggunakan HTTPS
-                        $image_url = str_replace('http://', 'https://', $image_url);
-                        frp_log_message("Final cleaned image URL: " . $image_url);
-                    }
-
-                    // Ambil konten - prioritaskan content:encoded untuk feed yang memilikinya
-                    $content = '';
-                    
-                    // 1. Cek content:encoded terlebih dahulu (untuk BikeSport News)
-                    if (isset($item->children('content', true)->encoded)) {
-                        $content_encoded = (string)$item->children('content', true)->encoded;
-                        if (!empty($content_encoded)) {
-                            // Bersihkan HTML dan ambil teks
-                            $content = strip_tags(html_entity_decode($content_encoded));
-                            // Hapus bagian "The post ... appeared first on ..." di akhir
-                            $content = preg_replace('/The post .* appeared first on .*\./s', '', $content);
-                            $content = trim($content);
-                            frp_log_message("Content extracted from content:encoded. Length: " . strlen($content));
-                        }
-                    }
-                    
-                    // 2. Jika tidak ada content:encoded atau kosong, gunakan description
-                    if (empty($content)) {
-                        $description = strip_tags(html_entity_decode((string)$item->description));
-                        // Hapus bagian "The post ... appeared first on ..." di akhir
-                        $description = preg_replace('/The post .* appeared first on .*\./s', '', $description);
-                        $content = trim($description);
-                        frp_log_message("Content extracted from description. Length: " . strlen($content));
-                    }
-
-                    frp_log_message("Processing article: {$original_title}");
-                    frp_log_message("Content length: " . strlen($content));
-                    
-                    // Jika konten masih kosong atau terlalu pendek, coba ambil dari URL artikel
-                    if (empty($content) || strlen($content) < 100) {
-                        frp_log_message("Content too short, fetching from article URL: " . $link);
-                        
-                        $article_response = wp_remote_get($link, [
-                            'timeout' => 30,
-                            'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                            'headers' => [
-                                'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                                'Accept-Language' => 'en-US,en;q=0.5',
-                            ]
-                        ]);
-                        
-                        if (!is_wp_error($article_response)) {
-                            $article_html = wp_remote_retrieve_body($article_response);
-                            
-                            // Ekstraksi konten khusus untuk BikeSport News
-                            if (strpos($link, 'bikesportnews.com') !== false) {
-                                $extracted_content = frp_extract_bikesport_content($article_html);
-                                if (!empty($extracted_content)) {
-                                    $content = $extracted_content;
-                                    frp_log_message("Content extracted from BikeSport News article. Length: " . strlen($content));
-                                }
-                            } else {
-                                // Gunakan ekstraksi umum untuk situs lain
-                                $extracted_content = frp_extract_article_content($article_html, $link);
-                                if (!empty($extracted_content)) {
-                                    $content = $extracted_content;
-                                    frp_log_message("Content extracted from article URL. Length: " . strlen($content));
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Jika masih tidak ada gambar, coba ambil dari konten artikel
-                    if (empty($image_url) && !empty($content)) {
-                        $article_response = wp_remote_get($link);
-                        if (!is_wp_error($article_response)) {
-                            $article_html = wp_remote_retrieve_body($article_response);
-                            $image_url = frp_extract_article_image($article_html, $link);
-                        }
-                    }
-
-                    if (empty($content)) {
-                        frp_log_message("Tidak dapat mengekstrak konten dari artikel: " . $link);
-                        continue;
-                    }
-
-                    frp_log_message("Final content length: " . strlen($content) . " karakter");
-                    
-                    // Simpan konten mentah untuk debugging
-                    $raw_content_log = plugin_dir_path(__FILE__) . 'raw_article_content.log';
-                    file_put_contents($raw_content_log, "=== Article Content from {$link} ===\n\n{$content}");
-
-                    // Cek filter kata kunci
-                    if (!empty($keywords)) {
-                        $keyword_found = false;
-                        foreach ($keywords as $keyword) {
-                            if (!empty($keyword) && 
-                                (stripos($original_title, $keyword) !== false || 
-                                stripos($content, $keyword) !== false)) {
-                                $keyword_found = true;
-                                frp_log_message("Keyword ditemukan: '$keyword'");
-                                break;
-                            }
-                        }
-                        
-                        if (!$keyword_found) {
-                            frp_log_message("Skip artikel - tidak mengandung kata kunci yang diinginkan");
-                            continue;
-                        }
-                    }
-
-                    // Cek kata kunci yang dikecualikan
-                    $skip_article = false;
-                    foreach ($exclude_keywords as $exclude_keyword) {
-                        if (!empty($exclude_keyword) && (stripos($original_title, $exclude_keyword) !== false || 
-                            stripos($content, $exclude_keyword) !== false)) {
-                            frp_log_message("Skipping article as it contains excluded keyword '{$exclude_keyword}'");
-                            $skip_article = true;
-                            break;
-                        }
-                    }
-                    if ($skip_article) continue;
-
-                    // Cek artikel yang sudah diproses
-                    if ($ignore_processed_urls === '1' && in_array($link, $processed_urls)) {
-                        frp_log_message("Skipping already processed article");
-                        continue;
-                    }
-
-                    // Proses rewrite dengan konten lengkap
-                    frp_log_message("Starting content rewriting process...");
-                    $new_title_and_content = frp_rewrite_title_and_content($original_title, $content);
-
-                    if ($new_title_and_content) {
-                        // Post ke WordPress
-                        $post_id = wp_insert_post([
-                            'post_title' => $new_title_and_content['title'],
-                            'post_content' => $new_title_and_content['content'],
-                            'post_status' => 'publish',
-                            'post_type' => 'post',
-                            'post_category' => $selected_category ? [$selected_category] : [],
-                            'meta_input' => [
-                                '_frp_generated' => 1,
-                                '_frp_source_feed' => $feed_url,
-                                '_frp_source_link' => $link
-                            ],
-                        ]);
-
-                        if ($post_id) {
-                            frp_log_message("Successfully created new post with ID: " . $post_id);
-                            
-                            // Set featured image jika ada
-                            if ($image_url) {
-                                frp_set_featured_image($post_id, $image_url, $new_title_and_content['title'], $content);
-                            }
-
-                                                        // Generate dan set tags
-                            $tags = frp_generate_tags($new_title_and_content['content']);
-                            if ($tags) {
-                                wp_set_post_tags($post_id, $tags);
-                            }
-
-                            // Update processed URLs
-                            $processed_urls[] = $link;
-                            update_option('frp_processed_urls', $processed_urls);
-                            update_option('frp_last_processed_date', $pub_date);
-                            
-                            $article_found = true;
-                            break; // Keluar dari loop setelah satu artikel berhasil diproses
-                        } else {
-                            frp_log_message("Failed to create new post");
-                        }
-                    } else {
-                        frp_log_message("Failed to rewrite content");
-                    }
-                }
-            } elseif (isset($xml->entry)) {
-                frp_log_message("Detected Atom feed format with " . count($xml->entry) . " entries");
-                
-                foreach ($xml->entry as $entry) {
-                    $original_title = strip_tags((string)$entry->title);
-                    $link = '';
-                    
-                    // Atom feed bisa punya multiple link elements
-                    if (isset($entry->link)) {
-                        if (is_array($entry->link)) {
-                            foreach ($entry->link as $link_elem) {
-                                if ((string)$link_elem['rel'] === 'alternate' || empty($link)) {
-                                    $link = (string)$link_elem['href'];
-                                    break;
-                                }
-                            }
-                        } else {
-                            $link = (string)$entry->link['href'];
-                        }
-                    }
-                    
-                    if (empty($link)) {
-                        frp_log_message("No valid link found for Atom entry: " . $original_title);
-                        continue;
-                    }
-                    
-                    frp_log_message("Processing Atom entry: " . $original_title);
-                    // Untuk sementara hanya log, bisa dikembangkan lebih lanjut jika diperlukan
-                    break; // Process only one article for now
-                }
-            } else {
-                frp_log_message("ERROR: Feed format not recognized");
-                frp_log_message("Expected RSS (<rss><channel><item>) or Atom (<feed><entry>) structure");
-                
-                // Log struktur XML untuk debugging (batasi output)
-                if (isset($xml->channel)) {
-                    frp_log_message("Found <channel> but no <item> elements");
-                } elseif (isset($xml->feed)) {
-                    frp_log_message("Found <feed> but no <entry> elements");
-                } else {
-                    $xml_structure = print_r($xml, true);
-                    frp_log_message("XML root elements: " . substr($xml_structure, 0, 300) . "...");
-                }
-                
-                return;
-            }
-
-            if (!$article_found) {
-                frp_log_message("No suitable article found to process");
-            }
-
-        } catch (Exception $e) {
-            frp_log_message("Error in XML processing: " . $e->getMessage());
-            
-            // Simpan raw response untuk debugging
-            $debug_log = plugin_dir_path(__FILE__) . 'debug_raw_feed.log';
-            file_put_contents($debug_log, "=== Exception in XML Processing ===\n" . $e->getMessage() . "\n\n=== Raw Response ===\n" . $body);
-        }
-
-        // Setelah berhasil memproses satu artikel
-        if ($article_found) {
-            frp_log_message("Article processed successfully. Next execution will be at next scheduled time.");
-            
-            // Update waktu terakhir cron berjalan
-            update_option('frp_last_cron_run', current_time('mysql'));
-        }
+        // Update waktu terakhir cron berjalan
+        update_option('frp_last_cron_run', current_time('mysql'));
 
     } catch (Exception $e) {
         frp_log_message("Error in cron execution: " . $e->getMessage());
@@ -629,6 +291,367 @@ function frp_rewrite_feed_content() {
     }
 }
 
+// Fungsi untuk memproses single feed configuration
+function frp_process_single_feed($feed_url, $selected_category, $custom_prompt, $config_num) {
+    // Ambil pengaturan global
+    $fetch_latest_only = get_option('frp_fetch_latest_only', false);
+    $ignore_processed_urls = get_option('frp_ignore_processed_urls', false);
+    $processed_urls = get_option("frp_processed_urls_{$config_num}", []);
+    $ignore_no_image = get_option('frp_ignore_no_image', '1');
+    $keyword_filter = get_option('frp_keyword_filter', '');
+    $keywords = array_filter(array_map('trim', explode("\n", $keyword_filter)));
+    $exclude_keyword_filter = get_option('frp_exclude_keyword_filter', '');
+    $exclude_keywords = array_map('trim', explode(',', strtolower($exclude_keyword_filter)));
+
+    frp_log_message("Fetching content from feed URL: " . $feed_url);
+
+    // Mengambil konten dari URL feed
+    $response = wp_remote_get($feed_url, [
+        'timeout' => 30,
+        'user-agent' => 'Mozilla/5.0 (compatible; WordPress Feed Reader)',
+        'headers' => [
+            'Accept' => 'application/rss+xml, application/xml, text/xml',
+            'Accept-Language' => 'en-US,en;q=0.9',
+        ]
+    ]);
+
+    if (is_wp_error($response)) {
+        frp_log_message("Error fetching feed: " . $response->get_error_message());
+        return false;
+    }
+
+    $body = wp_remote_retrieve_body($response);
+    frp_log_message("Raw response length: " . strlen($body) . " characters");
+
+    // Bersihkan response body dari karakter yang tidak valid
+    $body = frp_clean_xml_response($body);
+
+    try {
+        $xml = frp_parse_xml_with_fallback($body);
+        
+        if ($xml === false) {
+            frp_log_message("Failed to parse XML feed after all attempts");
+            return false;
+        }
+        
+        $article_found = false;
+
+        // Process RSS feed
+        if (isset($xml->channel) && isset($xml->channel->item)) {
+            frp_log_message("Detected RSS feed format with " . count($xml->channel->item) . " items");
+            
+            foreach ($xml->channel->item as $item) {
+                $original_title = strip_tags((string)$item->title);
+                $link = (string)$item->link;
+                $pub_date = date('Y-m-d H:i:s', strtotime((string)$item->pubDate));
+
+                // Extract image URL
+                $image_url = frp_extract_image_from_item($item, $link);
+
+                // Extract content
+                $content = frp_extract_content_from_item($item, $link);
+
+                if (empty($content)) {
+                    frp_log_message("Tidak dapat mengekstrak konten dari artikel: " . $link);
+                    continue;
+                }
+
+                frp_log_message("Processing article: {$original_title}");
+                frp_log_message("Content length: " . strlen($content) . " karakter");
+
+                // Cek filter kata kunci
+                if (!empty($keywords)) {
+                    $keyword_found = false;
+                    foreach ($keywords as $keyword) {
+                        if (!empty($keyword) && 
+                            (stripos($original_title, $keyword) !== false || 
+                            stripos($content, $keyword) !== false)) {
+                            $keyword_found = true;
+                            frp_log_message("Keyword ditemukan: '$keyword'");
+                            break;
+                        }
+                    }
+                    
+                    if (!$keyword_found) {
+                        frp_log_message("Skip artikel - tidak mengandung kata kunci yang diinginkan");
+                        continue;
+                    }
+                }
+
+                // Cek kata kunci yang dikecualikan
+                $skip_article = false;
+                foreach ($exclude_keywords as $exclude_keyword) {
+                    if (!empty($exclude_keyword) && (stripos($original_title, $exclude_keyword) !== false || 
+                        stripos($content, $exclude_keyword) !== false)) {
+                        frp_log_message("Skipping article as it contains excluded keyword '{$exclude_keyword}'");
+                        $skip_article = true;
+                        break;
+                    }
+                }
+                if ($skip_article) continue;
+
+                // Cek artikel yang sudah diproses
+                if ($ignore_processed_urls === '1' && in_array($link, $processed_urls)) {
+                    frp_log_message("Skipping already processed article");
+                    continue;
+                }
+
+                // Proses rewrite dengan custom prompt untuk config ini
+                frp_log_message("Starting content rewriting process with custom prompt...");
+                $new_title_and_content = frp_rewrite_title_and_content_with_prompt($original_title, $content, $custom_prompt);
+
+                if ($new_title_and_content) {
+                    // Post ke WordPress
+                    $post_id = wp_insert_post([
+                        'post_title' => $new_title_and_content['title'],
+                        'post_content' => $new_title_and_content['content'],
+                        'post_status' => 'publish',
+                        'post_type' => 'post',
+                        'post_category' => $selected_category ? [$selected_category] : [],
+                        'meta_input' => [
+                            '_frp_generated' => 1,
+                            '_frp_source_feed' => $feed_url,
+                            '_frp_source_link' => $link,
+                            '_frp_config_num' => $config_num
+                        ],
+                    ]);
+
+                    if ($post_id) {
+                        frp_log_message("Successfully created new post with ID: " . $post_id);
+                        
+                        // Set featured image jika ada
+                        if ($image_url) {
+                            frp_set_featured_image($post_id, $image_url, $new_title_and_content['title'], $content);
+                        }
+
+                        // Generate dan set tags
+                        $tags = frp_generate_tags($new_title_and_content['content']);
+                        if ($tags) {
+                            wp_set_post_tags($post_id, $tags);
+                        }
+
+                        // Update processed URLs untuk config ini
+                        $processed_urls[] = $link;
+                        update_option("frp_processed_urls_{$config_num}", $processed_urls);
+                        update_option("frp_last_processed_date_{$config_num}", $pub_date);
+                        
+                        $article_found = true;
+                        break; // Keluar dari loop setelah satu artikel berhasil diproses
+                    } else {
+                        frp_log_message("Failed to create new post");
+                    }
+                } else {
+                    frp_log_message("Failed to rewrite content");
+                }
+            }
+        }
+
+        return $article_found;
+
+    } catch (Exception $e) {
+        frp_log_message("Error in XML processing for config #{$config_num}: " . $e->getMessage());
+        return false;
+    }
+}
+
+// Fungsi untuk extract image dari item
+function frp_extract_image_from_item($item, $link) {
+    $image_url = '';
+    
+    // 1. Cek enclosure
+    if (isset($item->enclosure)) {
+        $image_url = (string)$item->enclosure['url'];
+        frp_log_message("Image found from enclosure: " . $image_url);
+    }
+    
+    // 2. Cek description
+    if (empty($image_url)) {
+        $description = (string)$item->description;
+        if (preg_match('/<img[^>]+src="([^"]+)"/', html_entity_decode($description), $matches)) {
+            $image_url = $matches[1];
+            frp_log_message("Image found from description: " . $image_url);
+        }
+    }
+    
+    // 3. Cek content:encoded
+    if (empty($image_url)) {
+        if (isset($item->children('content', true)->encoded)) {
+            $content_encoded = (string)$item->children('content', true)->encoded;
+            if (preg_match('/<img[^>]+src="([^"]+)"/', html_entity_decode($content_encoded), $matches)) {
+                $image_url = $matches[1];
+                frp_log_message("Image found from content:encoded: " . $image_url);
+            }
+        }
+    }
+    
+    // Bersihkan URL gambar
+    if (!empty($image_url)) {
+        $image_url = html_entity_decode($image_url);
+        $image_url = str_replace('http://', 'https://', $image_url);
+        frp_log_message("Final cleaned image URL: " . $image_url);
+    }
+    
+    return $image_url;
+}
+
+// Fungsi untuk extract content dari item
+function frp_extract_content_from_item($item, $link) {
+    $content = '';
+    
+    // 1. Cek content:encoded terlebih dahulu
+    if (isset($item->children('content', true)->encoded)) {
+        $content_encoded = (string)$item->children('content', true)->encoded;
+        if (!empty($content_encoded)) {
+            $content = strip_tags(html_entity_decode($content_encoded));
+            $content = preg_replace('/The post .* appeared first on .*\./s', '', $content);
+            $content = trim($content);
+            frp_log_message("Content extracted from content:encoded. Length: " . strlen($content));
+        }
+    }
+    
+    // 2. Jika tidak ada content:encoded, gunakan description
+    if (empty($content)) {
+        $description = strip_tags(html_entity_decode((string)$item->description));
+        $description = preg_replace('/The post .* appeared first on .*\./s', '', $description);
+        $content = trim($description);
+        frp_log_message("Content extracted from description. Length: " . strlen($content));
+    }
+    
+    // 3. Jika masih kosong atau terlalu pendek, ambil dari URL
+    if (empty($content) || strlen($content) < 100) {
+        frp_log_message("Content too short, fetching from article URL: " . $link);
+        
+        $article_response = wp_remote_get($link, [
+            'timeout' => 30,
+            'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'headers' => [
+                'Accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language' => 'en-US,en;q=0.5',
+            ]
+        ]);
+        
+        if (!is_wp_error($article_response)) {
+            $article_html = wp_remote_retrieve_body($article_response);
+            
+            if (strpos($link, 'bikesportnews.com') !== false) {
+                $extracted_content = frp_extract_bikesport_content($article_html);
+            } elseif (strpos($link, 'cnnindonesia.com') !== false) {
+                $extracted_content = frp_extract_cnn_content($article_html);
+            } else {
+                $extracted_content = frp_extract_article_content($article_html, $link);
+            }
+            
+            if (!empty($extracted_content)) {
+                $content = $extracted_content;
+                frp_log_message("Content extracted from article URL. Length: " . strlen($content));
+            }
+        }
+    }
+    
+    return $content;
+}
+
+// Fungsi rewrite dengan custom prompt
+function frp_rewrite_title_and_content_with_prompt($title, $content, $custom_prompt) {
+    $api_key = get_option('frp_api_key');
+    $model = get_option('frp_model', 'gpt-4.1-nano');
+    $language = get_option('frp_language', 'en');
+    $max_tokens = get_option('frp_max_tokens', 500);
+    $temperature = get_option('frp_temperature', 0.5);
+
+    // Buat prompt dengan custom prompt yang diberikan
+    $prompt = "{$custom_prompt}\n\n" . 
+          "Rewrite the following title and content to make it suitable for publishing. " . 
+          "Ensure the title is concise (maximum 65 characters) and engaging, and the content is well-structured without using unnecessary labels like 'Title:', 'Content:', or 'Let's continue...'. " . 
+          "The rewritten text should be in " . ($language === 'id' ? 'Bahasa Indonesia' : 'English') . ".\n\n" .
+          "Title: {$title}\n\n" .
+          "Content:\n{$content}\n\n" .
+          "Please provide a polished and publishable title and content.";
+
+    // Request ke OpenAI API
+    $endpoint = 'https://api.openai.com/v1/chat/completions';
+
+    $request_body = [
+        'model' => $model,
+        'messages' => [
+            ['role' => 'user', 'content' => $prompt]
+        ],
+        'temperature' => (float) $temperature
+    ];
+
+    if ($max_tokens > 0) {
+        $request_body['max_tokens'] = (int) $max_tokens;
+    }
+
+    $response = wp_remote_post($endpoint, [
+        'body' => json_encode($request_body),
+        'headers' => [
+            'Content-Type' => 'application/json',
+            'Authorization' => 'Bearer ' . $api_key
+        ],
+        'timeout' => 60
+    ]);
+
+    if (is_wp_error($response)) {
+        frp_log_message("API request failed: " . $response->get_error_message());
+        return null;
+    }
+
+    $body = json_decode(wp_remote_retrieve_body($response), true);
+    if (isset($body['choices'][0]['message']['content'])) {
+        $generated_text = explode("\n\n", $body['choices'][0]['message']['content'], 2);
+        
+        $cleaned_title = frp_clean_text(trim($generated_text[0]), true);
+        $cleaned_content = frp_clean_text(trim($generated_text[1] ?? ''), false);
+
+        return [
+            'title' => $cleaned_title,
+            'content' => $cleaned_content
+        ];
+    } else {
+        frp_log_message("Error in API response: " . json_encode($body));
+        return null;
+    }
+}
+
+// Fungsi untuk schedule multi cron berdasarkan interval terpendek
+function frp_schedule_multi_feed_cron() {
+    $shortest_interval = 60; // Default 60 menit
+    
+    // Cari interval terpendek dari semua konfigurasi
+    for ($i = 1; $i <= 5; $i++) {
+        $feed_url = get_option("frp_feed_url_{$i}", '');
+        if (!empty($feed_url)) {
+            $interval = get_option("frp_cron_interval_{$i}", 60);
+            if ($interval < $shortest_interval) {
+                $shortest_interval = $interval;
+            }
+        }
+    }
+    
+    // Schedule cron dengan interval terpendek
+    $event_hook = 'frp_cron_event';
+    $existing_schedule = wp_next_scheduled($event_hook);
+    
+    if ($existing_schedule) {
+        wp_clear_scheduled_hook($event_hook);
+    }
+    
+    $next_run = time() + ($shortest_interval * 60);
+    wp_schedule_event($next_run, 'frp_custom_interval', $event_hook);
+    
+    // Update custom interval
+    update_option('frp_cron_interval', $shortest_interval);
+    
+    frp_log_message("Multi-feed cron scheduled with {$shortest_interval} minute interval");
+}
+
+// Update cron scheduling saat settings disimpan
+add_action('update_option_frp_feed_url_1', 'frp_schedule_multi_feed_cron');
+add_action('update_option_frp_feed_url_2', 'frp_schedule_multi_feed_cron');
+add_action('update_option_frp_feed_url_3', 'frp_schedule_multi_feed_cron');
+add_action('update_option_frp_feed_url_4', 'frp_schedule_multi_feed_cron');
+add_action('update_option_frp_feed_url_5', 'frp_schedule_multi_feed_cron');
 
 // Fungsi untuk membersihkan XML response
 function frp_clean_xml_response($xml_string) {
@@ -995,50 +1018,43 @@ function frp_display_generated_articles($max_posts = 20) {
     echo '</div>';
 }
 
-// Mendaftarkan pengaturan
+// Mendaftarkan pengaturan untuk multi feed
 function frp_register_settings() {
-    register_setting('frp_settings_group', 'frp_api_key', [
-        'type' => 'string', 
-        'sanitize_callback' => 'sanitize_text_field',
-        'default' => ''
-    ]);
-    register_setting('frp_settings_group', 'frp_feed_url', [
-        'type' => 'string',
-        'sanitize_callback' => 'sanitize_textarea_field',
-        'default' => ''
-    ]);
+    // Register settings untuk 5 feed configurations
+    for ($i = 1; $i <= 5; $i++) {
+        register_setting('frp_settings_group', "frp_feed_url_{$i}", [
+            'type' => 'string',
+            'sanitize_callback' => 'sanitize_textarea_field',
+            'default' => ''
+        ]);
+        register_setting('frp_settings_group', "frp_selected_category_{$i}");
+        register_setting('frp_settings_group', "frp_cron_interval_{$i}");
+        register_setting('frp_settings_group', "frp_custom_prompt_{$i}");
+    }
+    
+    // Keep existing single settings for backward compatibility
+    register_setting('frp_settings_group', 'frp_api_key');
     register_setting('frp_settings_group', 'frp_image_selector');    
     register_setting('frp_settings_group', 'frp_keyword_filter');
     register_setting('frp_settings_group', 'frp_exclude_keyword_filter');
-    register_setting('frp_settings_group', 'frp_cron_interval');
-    register_setting('frp_settings_group', 'frp_custom_prompt');
     register_setting('frp_settings_group', 'frp_model');
-    register_setting('frp_settings_group', 'frp_max_tokens'); // Opsi max tokens
-    register_setting('frp_settings_group', 'frp_temperature'); // Opsi temperature
+    register_setting('frp_settings_group', 'frp_max_tokens');
+    register_setting('frp_settings_group', 'frp_temperature');
     register_setting('frp_settings_group', 'frp_fetch_latest_only');
     register_setting('frp_settings_group', 'frp_language');
     register_setting('frp_settings_group', 'frp_ignore_processed_urls');
     register_setting('frp_settings_group', 'frp_ignore_no_image');
-    register_setting('frp_settings_group', 'frp_category');
-    register_setting('frp_settings_group', 'frp_selected_category');
-    register_setting('frp_settings_group', 'frp_enable_toc'); // Mengaktifkan atau menonaktifkan TOC
+    register_setting('frp_settings_group', 'frp_enable_toc');
     register_setting('frp_settings_group', 'frp_cron_status');
 
     add_settings_section('frp_main_settings', 'Main Settings', null, 'frp_settings');
+    add_settings_section('frp_feed_settings', 'Multi Feed Configuration', null, 'frp_settings');
 
+    // Main settings fields
     add_settings_field('frp_api_key', 'OpenAI API Key', 'frp_api_key_callback', 'frp_settings', 'frp_main_settings');
-    add_settings_field('frp_feed_url', 'Feed URL', 'frp_feed_url_callback', 'frp_settings', 'frp_main_settings');
-    add_settings_field(
-        'frp_image_selector', 
-        'Image Selector', 
-        'frp_image_selector_callback', 
-        'frp_settings', 
-        'frp_main_settings'
-    );
+    add_settings_field('frp_image_selector', 'Image Selector', 'frp_image_selector_callback', 'frp_settings', 'frp_main_settings');
     add_settings_field('frp_keyword_filter', 'Keyword Filter', 'frp_keyword_filter_callback', 'frp_settings', 'frp_main_settings');
-    add_settings_field('frp_exclude_keyword_filter', 'Exclude Keyword Filter', 'frp_exclude_keyword_filter_callback', 'frp_settings', 'frp_main_settings');    
-    add_settings_field('frp_cron_interval', 'Cron Interval (jam)', 'frp_cron_interval_callback', 'frp_settings', 'frp_main_settings');
-    add_settings_field('frp_custom_prompt', 'Custom Prompt', 'frp_custom_prompt_callback', 'frp_settings', 'frp_main_settings');
+    add_settings_field('frp_exclude_keyword_filter', 'Exclude Keyword Filter', 'frp_exclude_keyword_filter_callback', 'frp_settings', 'frp_main_settings');
     add_settings_field('frp_model', 'OpenAI Model', 'frp_model_callback', 'frp_settings', 'frp_main_settings');
     add_settings_field('frp_max_tokens', 'Max Tokens', 'frp_max_tokens_callback', 'frp_settings', 'frp_main_settings');
     add_settings_field('frp_temperature', 'Temperature', 'frp_temperature_callback', 'frp_settings', 'frp_main_settings');
@@ -1046,10 +1062,56 @@ function frp_register_settings() {
     add_settings_field('frp_language', 'Language', 'frp_language_callback', 'frp_settings', 'frp_main_settings');
     add_settings_field('frp_ignore_processed_urls', 'Ignore Processed URLs', 'frp_ignore_processed_urls_callback', 'frp_settings', 'frp_main_settings');
     add_settings_field('frp_ignore_no_image', 'Ignore Articles Without Images', 'frp_ignore_no_image_callback', 'frp_settings', 'frp_main_settings');
-    add_settings_field('frp_category', 'Category', 'frp_category_callback', 'frp_settings', 'frp_main_settings');
     add_settings_field('frp_cron_status', 'Pause/Stop Cron', 'frp_cron_status_callback', 'frp_settings', 'frp_main_settings');
+
+    // Multi feed configuration fields
+    for ($i = 1; $i <= 5; $i++) {
+        add_settings_field("frp_feed_config_{$i}", "Feed Configuration #{$i}", "frp_feed_config_{$i}_callback", 'frp_settings', 'frp_feed_settings');
+    }
 }
 add_action('admin_init', 'frp_register_settings');
+
+// Callback functions untuk multi feed configuration
+function frp_feed_config_1_callback() { frp_render_feed_config(1); }
+function frp_feed_config_2_callback() { frp_render_feed_config(2); }
+function frp_feed_config_3_callback() { frp_render_feed_config(3); }
+function frp_feed_config_4_callback() { frp_render_feed_config(4); }
+function frp_feed_config_5_callback() { frp_render_feed_config(5); }
+
+function frp_render_feed_config($config_num) {
+    $feed_url = get_option("frp_feed_url_{$config_num}", '');
+    $selected_category = get_option("frp_selected_category_{$config_num}", '');
+    $cron_interval = get_option("frp_cron_interval_{$config_num}", 60);
+    $custom_prompt = get_option("frp_custom_prompt_{$config_num}", 'Rewrite the following content:');
+    
+    $categories = get_categories(['hide_empty' => false]);
+    
+    echo '<div style="border: 1px solid #ddd; padding: 15px; margin: 10px 0; background: #f9f9f9;">';
+    
+    // Feed URL
+    echo '<p><label><strong>Feed URL:</strong></label><br>';
+    echo '<textarea name="frp_feed_url_' . $config_num . '" rows="2" style="width: 100%; max-width: 600px;">' . esc_textarea($feed_url) . '</textarea></p>';
+    
+    // Category
+    echo '<p><label><strong>Category:</strong></label><br>';
+    echo '<select name="frp_selected_category_' . $config_num . '" style="width: 200px;">';
+    echo '<option value="">Select Category</option>';
+    foreach ($categories as $category) {
+        $selected = ($selected_category == $category->term_id) ? 'selected' : '';
+        echo '<option value="' . esc_attr($category->term_id) . '" ' . $selected . '>' . esc_html($category->name) . '</option>';
+    }
+    echo '</select></p>';
+    
+    // Cron Interval
+    echo '<p><label><strong>Cron Interval (minutes):</strong></label><br>';
+    echo '<input type="number" name="frp_cron_interval_' . $config_num . '" value="' . esc_attr($cron_interval) . '" min="1" style="width: 100px;" /> minutes</p>';
+    
+    // Custom Prompt
+    echo '<p><label><strong>Custom Prompt:</strong></label><br>';
+    echo '<textarea name="frp_custom_prompt_' . $config_num . '" rows="3" style="width: 100%; max-width: 600px;">' . esc_textarea($custom_prompt) . '</textarea></p>';
+    
+    echo '</div>';
+}
 
 function frp_settings_page() {
     ?>
