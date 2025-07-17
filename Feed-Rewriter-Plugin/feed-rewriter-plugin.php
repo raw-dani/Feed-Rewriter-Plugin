@@ -42,19 +42,11 @@ function frp_render_settings_page() {
     ?>
     <div class="wrap">
         <h1>Feed Rewriter Settings</h1>
-        
-        <?php
-        // Tampilkan pesan sukses jika settings disimpan
-        if (isset($_GET['settings-updated']) && $_GET['settings-updated']) {
-            echo '<div class="notice notice-success is-dismissible"><p>Settings saved successfully!</p></div>';
-        }
-        ?>
-        
         <form method="post" action="options.php">
             <?php
             settings_fields('frp_settings_group');
             do_settings_sections('frp_settings');
-            submit_button('Save Settings');
+            submit_button();
             ?>
         </form>
 
@@ -66,24 +58,26 @@ function frp_render_settings_page() {
         </form>
 
         <?php
-        // Ganti bagian manual execute dengan:
-        if (isset($_POST['manual_execute']) && check_admin_referer('frp_manual_execution', 'frp_nonce')) {
-            // Clear semua lock sebelum manual execution
-            for ($i = 1; $i <= 5; $i++) {
-                delete_transient("frp_cron_running_feed_{$i}");
-            }
-            
-            frp_manual_execute_all_feeds();
-            echo "<div class='notice notice-success'><p>Manual execution completed. Check logs for details.</p></div>";
-        }
-
-        // Update clear lock untuk semua feed
+        // Handle clear lock
         if (isset($_POST['clear_lock']) && check_admin_referer('frp_manual_execution', 'frp_nonce')) {
-            for ($i = 1; $i <= 5; $i++) {
-                delete_transient("frp_cron_running_feed_{$i}");
-            }
             delete_transient('frp_cron_running');
-            echo "<div class='notice notice-success'><p>All cron locks cleared successfully!</p></div>";
+            frp_log_message("Cron lock cleared manually");
+            echo "<div class='notice notice-success'><p>Cron lock cleared successfully!</p></div>";
+        }
+        
+        // Cek apakah tombol "Run Now" ditekan
+        if (isset($_POST['manual_execute']) && check_admin_referer('frp_manual_execution', 'frp_nonce')) {
+            // Hapus transient sebelum menjalankan
+            delete_transient('frp_cron_running');
+            
+            frp_log_message("=== MANUAL EXECUTION STARTED ===");
+            frp_rewrite_feed_content();
+            
+            // Pastikan cron dijadwalkan ulang setelah manual execution
+            frp_ensure_cron_scheduled();
+            
+            frp_log_message("=== MANUAL EXECUTION COMPLETED ===");
+            echo "<div class='notice notice-success'><p>Manual execution completed. Check logs for details.</p></div>";
         }
         ?>
 
@@ -165,17 +159,46 @@ function frp_deactivate_plugin() {
     frp_log_message("Plugin dinonaktifkan dan cron jobs dihentikan.");
 }
 
-// Fungsi untuk mendaftarkan interval cron kustom untuk setiap feed
+// Perbaiki fungsi custom cron schedules
 function frp_custom_cron_schedules($schedules) {
-    for ($i = 1; $i <= 5; $i++) {
-        $interval_minutes = get_option("frp_cron_interval_{$i}", 60);
-        $schedules["frp_custom_interval_{$i}"] = [
-            'interval' => $interval_minutes * 60,
-            'display'  => sprintf(__('Feed %d - Every %d minutes'), $i, $interval_minutes)
+    $interval_minutes = get_option('frp_cron_interval', 60);
+    
+    // Pastikan interval minimal 1 menit
+    if ($interval_minutes < 1) {
+        $interval_minutes = 1;
+    }
+    
+    $schedules['frp_custom_interval'] = [
+        'interval' => $interval_minutes * 60,
+        'display'  => sprintf(__('Every %d minutes'), $interval_minutes)
+    ];
+    
+    // Tambahkan beberapa interval umum jika belum ada
+    if (!isset($schedules['every_minute'])) {
+        $schedules['every_minute'] = [
+            'interval' => 60,
+            'display'  => 'Every Minute'
         ];
     }
+    
+    if (!isset($schedules['fifteen_minutes'])) {
+        $schedules['fifteen_minutes'] = [
+            'interval' => 15 * 60,
+            'display'  => 'Every 15 Minutes'
+        ];
+    }
+    
+    if (!isset($schedules['thirty_minutes'])) {
+        $schedules['thirty_minutes'] = [
+            'interval' => 30 * 60,
+            'display'  => 'Every 30 Minutes'
+        ];
+    }
+    
     return $schedules;
 }
+
+// Pastikan filter selalu aktif
 add_filter('cron_schedules', 'frp_custom_cron_schedules');
 
 // Hook untuk aktivasi plugin
@@ -209,22 +232,22 @@ register_deactivation_hook(__FILE__, 'frp_on_deactivation');
 // Fungsi utama yang dipanggil oleh cron
 add_action('frp_cron_event', 'frp_rewrite_feed_content');
 
+// Perbaiki fungsi utama - pastikan cron dijadwal ulang setelah manual execution
 function frp_rewrite_feed_content() {
     // Cek apakah ini eksekusi manual atau cron
     $is_manual = isset($_POST['manual_execute']);
     
-    if (!$is_manual) {
-        frp_log_message("=== CRON EXECUTION START ===");
-    } else {
-        frp_log_message("=== MANUAL EXECUTION START ===");
+    if ($is_manual) {
+        frp_log_message("=== STARTING MANUAL EXECUTION ===");
+        // Untuk manual execution, hapus transient yang ada
         delete_transient('frp_cron_running');
-    }
-    
-    // Cek apakah cron sedang berjalan - SKIP CHECK untuk manual execution
-    if (!$is_manual) {
+    } else {
+        frp_log_message("=== STARTING CRON EXECUTION ===");
+        
+        // Cek apakah cron sedang berjalan hanya untuk cron execution
         $cron_running = get_transient('frp_cron_running');
         if ($cron_running) {
-            frp_log_message("⚠️ Cron already running - skipping execution");
+            frp_log_message("Cron is already running. Skipping this execution.");
             return;
         }
     }
@@ -237,30 +260,14 @@ function frp_rewrite_feed_content() {
 
         // Cek status cron - SKIP untuk manual execution
         if (!$is_manual && $cron_status === 'inactive') {
-            frp_log_message("⚠️ Cron status inactive - execution stopped");
+            frp_log_message("Cron job tidak dijalankan karena status inactive.");
             delete_transient('frp_cron_running');
             return;
         }
 
-        // Log semua feed yang aktif
-        $active_feeds_info = [];
-        for ($i = 1; $i <= 5; $i++) {
-            $feed_url = get_option("frp_feed_url_{$i}", '');
-            if (!empty($feed_url)) {
-                $interval = get_option("frp_cron_interval_{$i}", 60);
-                $last_run = get_option("frp_last_run_config_{$i}", 0);
-                $next_due = $last_run + ($interval * 60);
-                $time_left = $next_due - time();
-                
-                $active_feeds_info[] = "Feed #{$i}: interval={$interval}min, next_in=" . 
-                    ($time_left > 0 ? floor($time_left/60) . "m" : "DUE");
-            }
-        }
-        
-        frp_log_message("📊 Active feeds status: " . implode(' | ', $active_feeds_info));
-
         // Process each feed configuration
-        $processed_count = 0;
+        $any_article_processed = false;
+        
         for ($config_num = 1; $config_num <= 5; $config_num++) {
             $feed_url = get_option("frp_feed_url_{$config_num}", '');
             
@@ -273,65 +280,68 @@ function frp_rewrite_feed_content() {
             $cron_interval = get_option("frp_cron_interval_{$config_num}", 60);
             $custom_prompt = get_option("frp_custom_prompt_{$config_num}", 'Rewrite the following content:');
             
-            frp_log_message("--- Processing Feed #{$config_num} ---");
-            frp_log_message("🔗 URL: " . substr($feed_url, 0, 50) . "...");
-            frp_log_message("📁 Category: " . ($selected_category ? get_category($selected_category)->name : 'None'));
-            frp_log_message("⏰ Interval: {$cron_interval} minutes");
+            frp_log_message("Processing Feed Configuration #{$config_num}");
+            frp_log_message("Feed URL: {$feed_url}");
             
-            // Cek apakah sudah waktunya untuk memproses feed ini
-            $last_run_key = "frp_last_run_config_{$config_num}";
-            $last_run = get_option($last_run_key, 0);
-            $current_time = time();
-            $interval_seconds = $cron_interval * 60;
-            
-            if (!$is_manual && ($current_time - $last_run) < $interval_seconds) {
-                $time_left = $interval_seconds - ($current_time - $last_run);
-                $minutes_left = floor($time_left / 60);
-                $seconds_left = $time_left % 60;
-                frp_log_message("⏳ Feed #{$config_num} - Next run in {$minutes_left}m {$seconds_left}s - SKIPPED");
-                continue;
+            // Cek apakah sudah waktunya untuk memproses feed ini (skip untuk manual)
+            if (!$is_manual) {
+                $last_run_key = "frp_last_run_config_{$config_num}";
+                $last_run = get_option($last_run_key, 0);
+                $current_time = time();
+                $interval_seconds = $cron_interval * 60;
+                
+                if (($current_time - $last_run) < $interval_seconds) {
+                    $time_left = $interval_seconds - ($current_time - $last_run);
+                    frp_log_message("Config #{$config_num} - Next run in {$time_left} seconds. Skipping.");
+                    continue;
+                }
             }
-            
-            frp_log_message("🚀 Feed #{$config_num} - Processing started...");
             
             // Process this feed configuration
             $article_found = frp_process_single_feed($feed_url, $selected_category, $custom_prompt, $config_num);
             
             if ($article_found) {
                 // Update last run time untuk config ini
-                update_option($last_run_key, $current_time);
-                frp_log_message("✅ Feed #{$config_num} - Article processed successfully");
-                $processed_count++;
+                if (!$is_manual) {
+                    update_option("frp_last_run_config_{$config_num}", time());
+                }
+                frp_log_message("Config #{$config_num} - Article processed successfully.");
+                $any_article_processed = true;
                 
                 // Jika manual execution, proses semua feed. Jika cron, proses satu saja per execution
                 if (!$is_manual) {
                     break;
                 }
-            } else {
-                frp_log_message("❌ Feed #{$config_num} - No article processed");
             }
         }
 
         // Update waktu terakhir cron berjalan
-        update_option('frp_last_cron_run', current_time('mysql'));
-        
-        if ($is_manual) {
-            frp_log_message("📈 Manual execution completed - {$processed_count} articles processed");
-        } else {
-            frp_log_message("📈 Cron execution completed - {$processed_count} articles processed");
+        if ($any_article_processed || $is_manual) {
+            update_option('frp_last_cron_run', current_time('mysql'));
+            frp_log_message("Last cron run time updated");
         }
 
     } catch (Exception $e) {
-        frp_log_message("💥 ERROR: " . $e->getMessage());
+        frp_log_message("Error in execution: " . $e->getMessage());
     } finally {
         // Hapus flag cron running
         delete_transient('frp_cron_running');
-        frp_log_message("=== EXECUTION END ===");
+        frp_log_message("Cron lock released");
     }
 
+    // PENTING: Pastikan cron dijadwal ulang setelah manual execution
+    if ($is_manual) {
+        frp_log_message("Re-scheduling cron after manual execution...");
+        frp_schedule_multi_feed_cron();
+    }
+    
+    // Untuk cron execution, pastikan tetap terjadwal
     if (!$is_manual) {
+        frp_ensure_cron_scheduled();
         frp_check_cron_status();
     }
+    
+    frp_log_message($is_manual ? "=== MANUAL EXECUTION FINISHED ===" : "=== CRON EXECUTION FINISHED ===");
 }
 
 // Fungsi untuk memproses single feed configuration
@@ -664,49 +674,107 @@ function frp_rewrite_title_and_content_with_prompt($title, $content, $custom_pro
             'content' => $cleaned_content
         ];
     } else {
-            frp_log_message("Error in API response: " . json_encode($body));
-            return null;
-        }
+        frp_log_message("Error in API response: " . json_encode($body));
+        return null;
     }
+}
 
-// Fungsi untuk schedule multi cron berdasarkan interval terpendek
+// Perbaiki fungsi ensure cron scheduled
+function frp_ensure_cron_scheduled() {
+    $event_hook = 'frp_cron_event';
+    $next_scheduled = wp_next_scheduled($event_hook);
+    
+    if (!$next_scheduled) {
+        frp_log_message("WARNING: Cron not scheduled! Re-scheduling now...");
+        frp_schedule_multi_feed_cron();
+        
+        // Verifikasi setelah scheduling
+        $next_scheduled = wp_next_scheduled($event_hook);
+        if ($next_scheduled) {
+            frp_log_message("SUCCESS: Cron re-scheduled successfully");
+        } else {
+            frp_log_message("CRITICAL: Still failed to schedule cron after retry");
+        }
+    } else {
+        $time_until_next = $next_scheduled - time();
+        frp_log_message("Next cron scheduled in {$time_until_next} seconds (" . date('Y-m-d H:i:s', $next_scheduled) . ")");
+    }
+}
+
+// Perbaiki fungsi schedule multi feed cron
 function frp_schedule_multi_feed_cron() {
     $shortest_interval = 60; // Default 60 menit
-    $active_feeds = [];
     
     // Cari interval terpendek dari semua konfigurasi
     for ($i = 1; $i <= 5; $i++) {
         $feed_url = get_option("frp_feed_url_{$i}", '');
         if (!empty($feed_url)) {
             $interval = get_option("frp_cron_interval_{$i}", 60);
-            $active_feeds[] = "Feed #{$i}: {$interval}min";
             if ($interval < $shortest_interval) {
                 $shortest_interval = $interval;
             }
         }
     }
     
-    // Schedule cron dengan interval terpendek
-    $event_hook = 'frp_cron_event';
-    $existing_schedule = wp_next_scheduled($event_hook);
-    
-    if ($existing_schedule) {
-        wp_clear_scheduled_hook($event_hook);
-    }
-    
-    $next_run = time() + ($shortest_interval * 60);
-    wp_schedule_event($next_run, 'frp_custom_interval', $event_hook);
-    
-    // Update custom interval
+    // Update custom interval option terlebih dahulu
     update_option('frp_cron_interval', $shortest_interval);
     
-    frp_log_message("=== CRON SCHEDULING ===");
-    frp_log_message("Active feeds: " . implode(', ', $active_feeds));
-    frp_log_message("Shortest interval: {$shortest_interval} minutes");
-    frp_log_message("Next cron run: " . date('Y-m-d H:i:s', $next_run));
-    frp_log_message("========================");
+    // Clear existing schedule
+    $event_hook = 'frp_cron_event';
+    wp_clear_scheduled_hook($event_hook);
+    
+    // Pastikan custom interval terdaftar
+    add_filter('cron_schedules', 'frp_custom_cron_schedules');
+    
+    // Gunakan interval yang sudah ada di WordPress atau fallback ke hourly
+    $wp_schedules = wp_get_schedules();
+    $schedule_key = 'frp_custom_interval';
+    
+    // Jika custom interval tidak ada, gunakan yang terdekat
+    if (!isset($wp_schedules[$schedule_key])) {
+        frp_log_message("Custom interval not found, using fallback scheduling");
+        
+        // Pilih interval WordPress yang tersedia
+        if ($shortest_interval <= 5) {
+            $schedule_key = 'every_minute'; // Jika ada
+        } elseif ($shortest_interval <= 15) {
+            $schedule_key = 'fifteen_minutes'; // Jika ada
+        } elseif ($shortest_interval <= 30) {
+            $schedule_key = 'thirty_minutes'; // Jika ada
+        } else {
+            $schedule_key = 'hourly'; // Default WordPress
+        }
+        
+        // Jika interval yang dipilih tidak ada, gunakan hourly
+        if (!isset($wp_schedules[$schedule_key])) {
+            $schedule_key = 'hourly';
+        }
+    }
+    
+    // Schedule new cron
+    $next_run = time() + ($shortest_interval * 60);
+    $scheduled = wp_schedule_event($next_run, $schedule_key, $event_hook);
+    
+    if ($scheduled === false) {
+        frp_log_message("ERROR: Failed to schedule with {$schedule_key}, trying with hourly");
+        
+        // Fallback ke hourly jika gagal
+        $scheduled = wp_schedule_event($next_run, 'hourly', $event_hook);
+        
+        if ($scheduled === false) {
+            frp_log_message("CRITICAL ERROR: Failed to schedule cron even with hourly interval");
+            
+            // Last resort: schedule dengan wp_schedule_single_event
+            wp_schedule_single_event($next_run, $event_hook);
+            frp_log_message("Scheduled single cron event as fallback");
+        } else {
+            frp_log_message("Cron scheduled with hourly interval as fallback");
+        }
+    } else {
+        frp_log_message("Cron successfully scheduled with {$schedule_key} for: " . date('Y-m-d H:i:s', $next_run));
+        frp_log_message("Target interval: {$shortest_interval} minutes");
+    }
 }
-
 
 // Hapus fungsi lama dan ganti dengan sistem jadwal terpisah
 function frp_schedule_individual_feed_crons() {
@@ -1268,13 +1336,13 @@ function frp_register_settings() {
     add_settings_field('frp_fetch_latest_only', 'Fetch Latest Articles Only', 'frp_fetch_latest_only_callback', 'frp_settings', 'frp_main_settings');
     add_settings_field('frp_language', 'Language', 'frp_language_callback', 'frp_settings', 'frp_main_settings');
     add_settings_field('frp_ignore_processed_urls', 'Ignore Processed URLs', 'frp_ignore_processed_urls_callback', 'frp_settings', 'frp_main_settings');
-    add_settings_field('frp_ignore_no_image', 'Ignore Articles Without Images', 'frp_ignore_no_image_callback', 'frp_settings', 'frp_main_settings');
-    add_settings_field('frp_cron_status', 'Pause/Stop Cron', 'frp_cron_status_callback', 'frp_settings', 'frp_main_settings');
+    add_settings_field('frp_ignore_no_image', 'Ignore Articles Without Images', 'frp_ignore_no_image_callback', 'frp_settings', 'frp_main_settings');    
 
     // Multi feed configuration fields
     for ($i = 1; $i <= 5; $i++) {
         add_settings_field("frp_feed_config_{$i}", "Feed Configuration #{$i}", "frp_feed_config_{$i}_callback", 'frp_settings', 'frp_feed_settings');
     }
+    add_settings_field('frp_cron_status', 'Pause/Stop Cron', 'frp_cron_status_callback', 'frp_settings', 'frp_main_settings');
 }
 add_action('admin_init', 'frp_register_settings');
 
