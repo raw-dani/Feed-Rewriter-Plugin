@@ -899,38 +899,96 @@ function frp_rewrite_with_openai($title, $content, $custom_prompt) {
 }
 
 /**
- * Clean output content - add TOC, formatting, etc.
+ * Clean output content - add TOC, formatting, etc. (Google SEO Optimized)
  */
 function frp_clean_output_content($content) {
     // Convert markdown
     $content = preg_replace('/^###\s+(.*)$/m', '<h2>$1</h2>', $content);
     $content = preg_replace('/\*\*(.*?)\*\*/', '<strong>$1</strong>', $content);
     
-    // Add TOC if enabled
+    // Add TOC if enabled - Google SEO Optimized Version
     if (get_option('frp_enable_toc', 'yes') === 'yes') {
         preg_match_all('/<h2[^>]*>(.*?)<\/h2>/i', $content, $matches);
         
         if (!empty($matches[1])) {
-            $toc = "<div class='frp-toc'><h3>Table of Contents</h3><ul>";
+            // Add smooth scroll CSS to content
+            $smooth_scroll_css = '
+<style>
+.frp-toc { background: #f9f9f9; padding: 20px; margin: 20px 0; border-radius: 8px; }
+.frp-toc h3 { margin-top: 0; margin-bottom: 15px; font-size: 18px; }
+.frp-toc ul { margin: 0; padding-left: 20px; }
+.frp-toc li { margin-bottom: 8px; }
+.frp-toc a { color: #0066cc; text-decoration: none; }
+.frp-toc a:hover { text-decoration: underline; }
+html { scroll-behavior: smooth; }
+</style>
+';
             
-            foreach ($matches[1] as $heading) {
+            // Build TOC with proper semantic HTML and ARIA for accessibility
+            $toc_id = 'frp-toc-' . uniqid();
+            $toc = '<nav aria-label="Table of Contents" id="' . $toc_id . '" class="frp-toc">';
+            $toc .= '<h3>Table of Contents</h3>';
+            $toc .= '<ul>';
+            
+            // Build schema.org structured data for navigation
+            $toc_items = [];
+            
+            foreach ($matches[1] as $index => $heading) {
                 $slug = sanitize_title_with_dashes(strip_tags($heading));
-                $toc .= "<li><a href='#{$slug}'>" . strip_tags($heading) . "</a></li>";
+                // Ensure unique IDs
+                $slug = $slug . '-' . $index;
+                $heading_text = strip_tags($heading);
+                
+                $toc .= '<li><a href="#' . esc_attr($slug) . '">' . esc_html($heading_text) . '</a></li>';
+                
+                // Add ID to heading
                 $content = preg_replace(
-                    '/(<h2[^>]*>)' . preg_quote($heading, '/') . '(<\/h2>)/i',
-                    '$1 id="' . $slug . '">$2',
+                    '/(<h2[^>]*>)(' . preg_quote($heading_text, '/') . ')(<\/h2>)/i',
+                    '$1 id="' . esc_attr($slug) . '">$2$3',
                     $content,
                     1
                 );
+                
+                // Add to schema items
+                $toc_items[] = [
+                    '@type' => 'ListItem',
+                    'position' => $index + 1,
+                    'name' => $heading_text,
+                    'item' => '#' . $slug
+                ];
             }
             
-            $toc .= "</ul></div>";
-            $content = $toc . "\n" . $content;
+            $toc .= '</ul></nav>';
+            
+            // Prepend smooth scroll CSS
+            $content = $smooth_scroll_css . $toc . "\n" . $content;
+            
+            // Store TOC schema for later output (will be added in schema function)
+            // This prevents conflict with existing NewsArticle schema
+            global $frp_toc_schema;
+            $frp_toc_schema = [
+                '@context' => 'https://schema.org',
+                '@type' => 'ItemList',
+                'itemListElement' => $toc_items,
+                'description' => 'Table of Contents for this article'
+            ];
         }
     }
     
     return $content;
 }
+
+/**
+ * Add TOC Schema.org markup to wp_head (separate from Article schema to avoid conflicts)
+ */
+function frp_add_toc_schema_markup() {
+    global $frp_toc_schema;
+    
+    if (!empty($frp_toc_schema)) {
+        echo '<script type="application/ld+json">' . json_encode($frp_toc_schema) . '</script>' . "\n";
+    }
+}
+add_action('wp_head', 'frp_add_toc_schema_markup', 5); // Run early to avoid conflicts
 
 /**
  * Generate tags for post
