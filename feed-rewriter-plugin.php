@@ -91,6 +91,8 @@ function frp_init_default_options() {
         'frp_exclude_keyword_filter' => '',
         'frp_post_status' => 'publish', // NEW: Post status selection
         'frp_enable_retry' => '1', // NEW: Enable retry logic
+        'frp_enable_internal_linking' => '1', // NEW: Internal linking
+        'frp_internal_links_max' => 3, // Max internal links per article
     ];
     
     foreach ($defaults as $key => $value) {
@@ -1502,6 +1504,75 @@ function frp_add_schema_markup($post_id, $title, $content, $image_url = '') {
     });
     
     frp_log_message("  -> Schema.org markup added");
+}
+
+/**
+ * Add Internal Links to generated content - SEO Optimized
+ * Links to related articles based on category or keywords
+ */
+function frp_add_internal_links($post_id, $content, $category_id = '') {
+    // Check if internal linking is enabled
+    if (get_option('frp_enable_internal_linking', '1') !== '1') {
+        return $content;
+    }
+    
+    $max_links = get_option('frp_internal_links_max', 3);
+    if ($max_links < 1) {
+        $max_links = 3;
+    }
+    
+    // Get existing generated posts to link to (exclude current post)
+    $args = [
+        'post_type' => 'post',
+        'posts_per_page' => $max_links,
+        'post_status' => 'publish',
+        'post__not_in' => [$post_id],
+        'meta_key' => '_frp_generated',
+        'meta_value' => '1',
+        'orderby' => 'date',
+        'order' => 'DESC'
+    ];
+    
+    // If category is specified, filter by category
+    if (!empty($category_id)) {
+        $args['cat'] = $category_id;
+    }
+    
+    $related_posts = get_posts($args);
+    
+    if (empty($related_posts)) {
+        frp_log_message("  -> No related posts found for internal linking");
+        return $content;
+    }
+    
+    // Build internal links section
+    $links_html = "\n\n" . '<div class="frp-related-articles">' . "\n";
+    $links_html .= '<h3>Artikel Terkait</h3>' . "\n";
+    $links_html .= '<ul>' . "\n";
+    
+    $link_count = 0;
+    foreach ($related_posts as $related) {
+        if ($link_count >= $max_links) {
+            break;
+        }
+        
+        // Get post URL
+        $post_url = get_permalink($related->ID);
+        $post_title = get_the_title($related->ID);
+        
+        // Add to list
+        $links_html .= '<li><a href="' . esc_url($post_url) . '" title="' . esc_attr($post_title) . '">' . esc_html($post_title) . '</a></li>' . "\n";
+        
+        $link_count++;
+    }
+    
+    $links_html .= '</ul>' . "\n";
+    $links_html .= '</div>' . "\n";
+    
+    frp_log_message("  -> Added {$link_count} internal links");
+    
+    // Append to content
+    return $content . $links_html;
 }
 
 // ==============================================================================
