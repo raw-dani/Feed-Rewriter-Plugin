@@ -22,7 +22,7 @@ if (!defined('ABSPATH')) {
 // ==============================================================================
 
 // Define plugin constants
-define('FRP_VERSION', '1.1.0');
+define('FRP_VERSION', '1.2.0');
 define('FRP_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('FRP_LOG_FILE', FRP_PLUGIN_DIR . 'frp_log.txt');
 define('FRP_MAX_LOG_SIZE', 5242880); // 5MB max log file size
@@ -89,6 +89,8 @@ function frp_init_default_options() {
         'frp_enhanced_max_sources' => 3,
         'frp_keyword_filter' => '',
         'frp_exclude_keyword_filter' => '',
+        'frp_post_status' => 'publish', // NEW: Post status selection
+        'frp_enable_retry' => '1', // NEW: Enable retry logic
     ];
     
     foreach ($defaults as $key => $value) {
