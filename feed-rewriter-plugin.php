@@ -1218,6 +1218,18 @@ add_action('admin_menu', 'frp_add_admin_menu');
  * Render settings page
  */
 function frp_render_settings_page() {
+    // Handle Pause All Crons
+    if (isset($_POST['frp_pause_all']) && check_admin_referer('frp_cron_control')) {
+        frp_pause_all_crons();
+        echo '<div class="notice notice-warning"><p><strong>⏸️ Paused:</strong> All cron jobs have been paused. Plugin is now idle and will not consume server resources.</p></div>';
+    }
+    
+    // Handle Resume All Crons
+    if (isset($_POST['frp_resume_all']) && check_admin_referer('frp_cron_control')) {
+        frp_resume_all_crons();
+        echo '<div class="notice notice-success"><p><strong>▶️ Resumed:</strong> All cron jobs have been resumed. Plugin is now active.</p></div>';
+    }
+    
     // Handle form submission
     if (isset($_POST['frp_run_now']) && check_admin_referer('frp_manual_run')) {
         delete_transient(FRP_TRANSIENT_PREFIX . 'cron_running');
@@ -1232,10 +1244,81 @@ function frp_render_settings_page() {
         frp_log_message("Lock cleared manually");
         echo '<div class="notice notice-success"><p>Lock cleared.</p></div>';
     }
+    
+    // Get current status
+    $cron_status = get_option('frp_cron_status', 'active');
+    $is_paused = ($cron_status === 'paused');
     ?>
     <div class="wrap">
         <h1>Feed Rewriter Settings</h1>
         
+        <?php
+        // Show prominent status banner
+        if ($is_paused) {
+            echo '<div class="notice notice-warning" style="padding: 15px; margin: 20px 0;">';
+            echo '<p style="font-size: 16px; margin: 0;"><span style="font-size: 20px;">⏸️</span> <strong>Plugin is PAUSED</strong> - All cron jobs are disabled. No articles will be generated automatically.</p>';
+            echo '</div>';
+        } else {
+            $next_run = wp_next_scheduled(FRP_CRON_HOOK);
+            if ($next_run) {
+                $time_diff = human_time_diff(time(), $next_run);
+                echo '<div class="notice notice-success" style="padding: 15px; margin: 20px 0;">';
+                echo '<p style="font-size: 16px; margin: 0;"><span style="font-size: 20px;">✅</span> <strong>Plugin is ACTIVE</strong> - Next run in ' . esc_html($time_diff) . '.</p>';
+                echo '</div>';
+            }
+        }
+        ?>
+        
+        <!-- Cron Control Panel -->
+        <div class="postbox" style="margin: 20px 0; padding: 15px;">
+            <h2 style="margin-top: 0;">🤖 Plugin Control Panel</h2>
+            
+            <div style="display: flex; gap: 15px; flex-wrap: wrap; align-items: center;">
+                <?php if ($is_paused) : ?>
+                    <!-- Resume Button -->
+                    <form method="post" style="display: inline;">
+                        <?php wp_nonce_field('frp_cron_control'); ?>
+                        <button type="submit" name="frp_resume_all" class="button button-primary" style="font-size: 14px; padding: 8px 20px; height: auto;">
+                            ▶️ Resume All Cron Jobs
+                        </button>
+                    </form>
+                <?php else : ?>
+                    <!-- Pause Button -->
+                    <form method="post" style="display: inline;">
+                        <?php wp_nonce_field('frp_cron_control'); ?>
+                        <button type="submit" name="frp_pause_all" class="button button-secondary" style="font-size: 14px; padding: 8px 20px; height: auto; color: #b32d2e; border-color: #b32d2e;">
+                            ⏸️ Pause All Cron Jobs
+                        </button>
+                    </form>
+                <?php endif; ?>
+                
+                <!-- Manual Run -->
+                <form method="post" style="display: inline;">
+                    <?php wp_nonce_field('frp_manual_run'); ?>
+                    <button type="submit" name="frp_run_now" class="button" style="font-size: 14px; padding: 8px 20px; height: auto;" <?php echo $is_paused ? '' : ''; ?>>
+                        🔄 Run Now (Manual)
+                    </button>
+                </form>
+                
+                <!-- Clear Lock -->
+                <form method="post" style="display: inline;">
+                    <?php wp_nonce_field('frp_manual_run'); ?>
+                    <button type="submit" name="frp_clear_lock" class="button button-link" style="color: #666;">
+                        🔓 Clear Lock
+                    </button>
+                </form>
+            </div>
+            
+            <p class="description" style="margin-top: 15px;">
+                <strong>Pause:</strong> Menonaktifkan semua jadwal cron tanpa menonaktifkan plugin. 
+                Berguna untuk menghemat resource hosting atau saat maintenance.<br>
+                <strong>Resume:</strong> Mengaktifkan kembali semua jadwal cron.
+            </p>
+        </div>
+        
+        <hr>
+        
+        <h2>Settings Configuration</h2>
         <form method="post" action="options.php">
             <?php settings_fields('frp_settings_group'); ?>
             <?php do_settings_sections('frp_settings'); ?>
@@ -1244,26 +1327,56 @@ function frp_render_settings_page() {
         
         <hr>
         
-        <h2>Manual Execution</h2>
-        <form method="post">
-            <?php wp_nonce_field('frp_manual_run'); ?>
-            <p>
-                <button type="submit" name="frp_run_now" class="button button-primary">Run Now</button>
-                <button type="submit" name="frp_clear_lock" class="button button-secondary" style="margin-left: 10px;">Clear Lock</button>
-            </p>
-        </form>
-        
-        <hr>
-        
-        <h2>Status</h2>
-        <p><strong>Last cron run:</strong> <?php echo get_option('frp_last_cron_run', 'Never'); ?></p>
-        
-        <?php
-        $next_run = wp_next_scheduled(FRP_CRON_HOOK);
-        if ($next_run) {
-            echo '<p><strong>Next scheduled:</strong> ' . date('Y-m-d H:i:s', $next_run) . '</p>';
-        }
-        ?>
+        <h2>Status Information</h2>
+        <table class="widefat" style="max-width: 500px;">
+            <tr>
+                <td><strong>Cron Status:</strong></td>
+                <td>
+                    <?php 
+                    if ($is_paused) {
+                        echo '<span style="color: #dba617; font-weight: bold;">⏸️ Paused</span>';
+                    } else {
+                        echo '<span style="color: #46b450; font-weight: bold;">✅ Active</span>';
+                    }
+                    ?>
+                </td>
+            </tr>
+            <tr>
+                <td><strong>Last Run:</strong></td>
+                <td><?php echo get_option('frp_last_cron_run', 'Never'); ?></td>
+            </tr>
+            <?php
+            $next_run = wp_next_scheduled(FRP_CRON_HOOK);
+            if ($next_run && !$is_paused) {
+                echo '<tr>';
+                echo '<td><strong>Next Scheduled:</strong></td>';
+                echo '<td>' . date('Y-m-d H:i:s', $next_run) . ' (in ' . human_time_diff(time(), $next_run) . ')</td>';
+                echo '</tr>';
+            }
+            
+            // Check if cron is actually scheduled
+            $cron_array = _get_cron_array();
+            $frp_cron_found = false;
+            foreach ($cron_array as $timestamp => $cron) {
+                if (isset($cron[FRP_CRON_HOOK])) {
+                    $frp_cron_found = true;
+                    break;
+                }
+            }
+            
+            echo '<tr>';
+            echo '<td><strong>Cron Scheduled:</strong></td>';
+            echo '<td>' . ($frp_cron_found ? '<span style="color: #46b450;">Yes ✓</span>' : '<span style="color: #dc3232;">No ✗</span>') . '</td>';
+            echo '</tr>';
+            
+            // Show lock status
+            $lock = get_transient(FRP_TRANSIENT_PREFIX . 'cron_running');
+            echo '<tr>';
+            echo '<td><strong>Lock Status:</strong></td>';
+            echo '<td>' . ($lock ? '<span style="color: #dba617;">Locked (running)</span>' : '<span style="color: #46b450;">Unlocked</span>') . '</td>';
+            echo '</tr>';
+            ?>
+        </table>
         
         <hr>
         
@@ -1276,6 +1389,38 @@ function frp_render_settings_page() {
         <?php echo frp_display_generated_articles(); ?>
     </div>
     <?php
+}
+
+/**
+ * Pause all cron jobs - keeps plugin active but stops all scheduled tasks
+ */
+function frp_pause_all_crons() {
+    // Update status to paused
+    update_option('frp_cron_status', 'paused');
+    
+    // Clear the scheduled cron
+    wp_clear_scheduled_hook(FRP_CRON_HOOK);
+    
+    // Clear any running lock
+    delete_transient(FRP_TRANSIENT_PREFIX . 'cron_running');
+    
+    frp_log_message("⏸️ All cron jobs PAUSED by user - plugin is now idle");
+}
+
+/**
+ * Resume all cron jobs - reactivates the plugin
+ */
+function frp_resume_all_crons() {
+    // Update status to active
+    update_option('frp_cron_status', 'active');
+    
+    // Reschedule the main cron
+    frp_schedule_main_cron();
+    
+    // Clear any stale lock
+    delete_transient(FRP_TRANSIENT_PREFIX . 'cron_running');
+    
+    frp_log_message("▶️ All cron jobs RESUMED by user - plugin is now active");
 }
 
 /**
@@ -1799,6 +1944,9 @@ function frp_admin_notices() {
         return;
     }
     
+    $cron_status = get_option('frp_cron_status', 'active');
+    $is_paused = ($cron_status === 'paused');
+    
     // Check API key
     if (empty(get_option('frp_api_key'))) {
         echo '<div class="notice notice-warning"><p><strong>Feed Rewriter:</strong> Please configure your OpenAI API key to start generating articles.</p></div>';
@@ -1817,12 +1965,17 @@ function frp_admin_notices() {
         echo '<div class="notice notice-info"><p><strong>Feed Rewriter:</strong> No feed URLs configured. Add at least one feed URL below to start.</p></div>';
     }
     
-    // Check cron status
-    if (get_option('frp_cron_status') === 'paused') {
-        echo '<div class="notice notice-warning"><p><strong>Feed Rewriter:</strong> Cron is currently paused. Click "Run Now" for manual execution.</p></div>';
+    // Check cron status - only show if paused AND has configuration
+    if ($is_paused && $has_feeds) {
+        echo '<div class="notice notice-warning" style="border-left-color: #ffb900;"><p><strong>⏸️ Plugin Paused:</strong> All cron jobs are disabled. Click "Resume All Cron Jobs" to reactivate automatic article generation.</p></div>';
     }
     
-    // System requirements check
+    // Skip system requirements check if paused (not relevant)
+    if ($is_paused) {
+        return;
+    }
+    
+    // System requirements check (only when active)
     $system_check = frp_check_system_requirements();
     
     // Show issues as errors
