@@ -3,7 +3,7 @@
  * Plugin Name: Feed Rewriter Plugin
  * Plugin URI: https://github.com/raw-dani/Feed-Rewriter-Plugin
  * Description: Plugin untuk mengambil feed RSS dan menulis ulang konten menggunakan OpenAI
- * Version: 1.1.0
+ * Version: 1.2.1
  * Author: Rohmat Ali Wardani
  * Author URI: https://www.linkedin.com/in/rohmat-ali-wardani/
  * License: GPL v2 or later
@@ -22,9 +22,11 @@ if (!defined('ABSPATH')) {
 // ==============================================================================
 
 // Define plugin constants
-define('FRP_VERSION', '1.2.0');
+define('FRP_VERSION', '1.2.1'); // Consistent with plugin header
 define('FRP_PLUGIN_DIR', plugin_dir_path(__FILE__));
-define('FRP_LOG_FILE', FRP_PLUGIN_DIR . 'frp_log.txt');
+define('FRP_PLUGIN_URL', plugin_dir_url(__FILE__));
+// Store log in wp-content/uploads to prevent direct web access
+define('FRP_LOG_FILE', WP_CONTENT_DIR . '/uploads/frp-logs/frp_log.txt');
 define('FRP_MAX_LOG_SIZE', 5242880); // 5MB max log file size
 define('FRP_TRANSIENT_PREFIX', 'frp_');
 define('FRP_CRON_HOOK', 'frp_main_cron_event');
@@ -46,6 +48,9 @@ function frp_activate_plugin() {
     
     // Set initial cron status
     update_option('frp_cron_status', 'active');
+    
+    // Create log directory if not exists
+    frp_create_log_directory();
     
     // Schedule the main cron event
     frp_schedule_main_cron();
@@ -117,6 +122,29 @@ function frp_clear_all_cron_schedules() {
 }
 
 /**
+ * Create log directory with proper protection
+ */
+function frp_create_log_directory() {
+    $log_dir = dirname(FRP_LOG_FILE);
+    
+    if (!file_exists($log_dir)) {
+        wp_mkdir_p($log_dir);
+        
+        // Create .htaccess to prevent direct access
+        $htaccess_path = $log_dir . '/.htaccess';
+        if (!file_exists($htaccess_path)) {
+            file_put_contents($htaccess_path, "# Deny access to this directory\nOrder deny,allow\nDeny from all\n<Files ~ \"^\\.htaccess\">\nAllow from all\n</Files>");
+        }
+        
+        // Create empty index.php for extra security
+        $index_path = $log_dir . '/index.php';
+        if (!file_exists($index_path)) {
+            file_put_contents($index_path, "<?php // Silence is golden");
+        }
+    }
+}
+
+/**
  * Schedule the main cron event
  */
 function frp_schedule_main_cron() {
@@ -149,7 +177,7 @@ function frp_register_cron_schedules($schedules = []) {
         
         $schedules['frp_custom_interval'] = [
             'interval' => $interval * 60,
-            'display'  => sprintf(__('Every %d minutes'), $interval)
+            'display'  => sprintf(__('Every %d minutes', 'feed-rewriter-plugin'), $interval)
         ];
     }
     
@@ -157,21 +185,21 @@ function frp_register_cron_schedules($schedules = []) {
     if (!isset($schedules['every_minute'])) {
         $schedules['every_minute'] = [
             'interval' => 60,
-            'display'  => __('Every Minute')
+            'display'  => __('Every Minute', 'feed-rewriter-plugin')
         ];
     }
     
     if (!isset($schedules['fifteen_minutes'])) {
         $schedules['fifteen_minutes'] = [
             'interval' => 15 * 60,
-            'display'  => __('Every 15 Minutes')
+            'display'  => __('Every 15 Minutes', 'feed-rewriter-plugin')
         ];
     }
     
     if (!isset($schedules['thirty_minutes'])) {
         $schedules['thirty_minutes'] = [
             'interval' => 30 * 60,
-            'display'  => __('Every 30 Minutes')
+            'display'  => __('Every 30 Minutes', 'feed-rewriter-plugin')
         ];
     }
     
@@ -1036,69 +1064,136 @@ function frp_generate_post_tags($content) {
 }
 
 /**
- * Set featured image for post
+ * Set featured image for post with security validation
  */
 function frp_set_post_thumbnail($post_id, $image_url) {
     if (empty($image_url)) {
-        return;
+        return false;
     }
     
     // Validate URL
     $image_url = html_entity_decode(trim($image_url));
     if (!filter_var($image_url, FILTER_VALIDATE_URL)) {
-        return;
+        frp_log_message("  -> Invalid image URL format");
+        return false;
     }
     
-    // Download image
-    $image_data = @file_get_contents($image_url, false, stream_context_create([
-        'http' => ['timeout' => 30, 'user_agent' => 'Mozilla/5.0'],
-        'ssl' => ['verify_peer' => false]
-    ]));
+    // Validate URL scheme (only allow http/https)
+    $url_scheme = parse_url($image_url, PHP_URL_SCHEME);
+    if (!in_array($url_scheme, ['http', 'https'])) {
+        frp_log_message("  -> Invalid URL scheme");
+        return false;
+    }
     
-    if (!$image_data) {
-        // Try curl
-        if (function_exists('curl_init')) {
-            $ch = curl_init($image_url);
-            curl_setopt_array($ch, [
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_TIMEOUT => 30,
-                CURLOPT_SSL_VERIFYPEER => false
-            ]);
-            $image_data = curl_exec($ch);
-            curl_close($ch);
+    // Download image using WordPress HTTP API (more secure)
+    $response = wp_remote_get($image_url, [
+        'timeout' => 30,
+        'user-agent' => 'Mozilla/5.0 (WordPress Feed Rewriter Plugin)',
+        'sslverify' => true, // Enable SSL verification for security
+        'redirection' => 5,
+    ]);
+    
+    if (is_wp_error($response)) {
+        frp_log_message("  -> Failed to download image: " . $response->get_error_message());
+        return false;
+    }
+    
+    $image_data = wp_remote_retrieve_body($response);
+    $content_type = wp_remote_retrieve_header($response, 'content-type');
+    
+    if (empty($image_data)) {
+        frp_log_message("  -> Empty image data received");
+        return false;
+    }
+    
+    // Validate file size (max 10MB)
+    if (strlen($image_data) > 10 * 1024 * 1024) {
+        frp_log_message("  -> Image file too large (>10MB)");
+        return false;
+    }
+    
+    // Determine file extension from content-type or URL
+    $allowed_types = [
+        'image/jpeg' => 'jpg',
+        'image/jpg' => 'jpg',
+        'image/png' => 'png',
+        'image/gif' => 'gif',
+        'image/webp' => 'webp',
+    ];
+    
+    $ext = '';
+    if (!empty($content_type) && isset($allowed_types[$content_type])) {
+        $ext = $allowed_types[$content_type];
+    } else {
+        // Fallback to URL extension
+        $url_ext = strtolower(pathinfo(parse_url($image_url, PHP_URL_PATH), PATHINFO_EXTENSION));
+        if (in_array($url_ext, ['jpg', 'jpeg', 'png', 'gif', 'webp'])) {
+            $ext = $url_ext === 'jpeg' ? 'jpg' : $url_ext;
         }
     }
     
-    if (!$image_data) {
-        return;
-    }
-    
-    $upload_dir = wp_upload_dir();
-    $ext = pathinfo(parse_url($image_url, PHP_URL_PATH), PATHINFO_EXTENSION);
     if (empty($ext)) {
-        $ext = 'jpg';
+        frp_log_message("  -> Could not determine valid image type");
+        return false;
     }
     
+    // Validate image data using WordPress functions
+    $upload_dir = wp_upload_dir();
     $filename = sanitize_file_name("frp-" . uniqid() . "." . $ext);
     $file_path = $upload_dir['path'] . '/' . $filename;
     
-    if (file_put_contents($file_path, $image_data)) {
-        $wp_filetype = wp_check_filetype($filename, null);
-        $attachment = [
-            'post_mime_type' => $wp_filetype['type'],
-            'post_title' => get_the_title($post_id),
-            'post_status' => 'inherit'
-        ];
-        
-        $attach_id = wp_insert_attachment($attachment, $file_path, $post_id);
-        
-        if ($attach_id) {
-            require_once(ABSPATH . 'wp-admin/includes/image.php');
-            $metadata = wp_generate_attachment_metadata($attach_id, $file_path);
-            wp_update_attachment_metadata($attach_id, $metadata);
-            set_post_thumbnail($post_id, $attach_id);
-        }
+    // Write file
+    if (!file_put_contents($file_path, $image_data)) {
+        frp_log_message("  -> Failed to write image file");
+        return false;
     }
+    
+    // Validate that it's actually an image using getimagesize
+    $image_info = @getimagesize($file_path);
+    if (!$image_info) {
+        // Not a valid image - delete and return
+        @unlink($file_path);
+        frp_log_message("  -> Downloaded file is not a valid image");
+        return false;
+    }
+    
+    // Get file type
+    $wp_filetype = wp_check_filetype_and_ext($file_path, $filename);
+    
+    // Validate mime type
+    $valid_mime_types = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+    if (!in_array($wp_filetype['type'], $valid_mime_types)) {
+        @unlink($file_path);
+        frp_log_message("  -> Invalid image mime type: " . $wp_filetype['type']);
+        return false;
+    }
+    
+    // Create attachment
+    $attachment = [
+        'post_mime_type' => $wp_filetype['type'],
+        'post_title' => sanitize_text_field(get_the_title($post_id)),
+        'post_status' => 'inherit',
+        'post_content' => '',
+    ];
+    
+    $attach_id = wp_insert_attachment($attachment, $file_path, $post_id);
+    
+    if (is_wp_error($attach_id) || !$attach_id) {
+        @unlink($file_path);
+        frp_log_message("  -> Failed to create attachment");
+        return false;
+    }
+    
+    // Generate attachment metadata
+    require_once(ABSPATH . 'wp-admin/includes/image.php');
+    $metadata = wp_generate_attachment_metadata($attach_id, $file_path);
+    wp_update_attachment_metadata($attach_id, $metadata);
+    
+    // Set as featured image
+    set_post_thumbnail($post_id, $attach_id);
+    
+    frp_log_message("  -> Featured image set successfully (ID: {$attach_id})");
+    return true;
 }
 
 // ==============================================================================
@@ -1460,6 +1555,7 @@ function frp_add_seo_meta($post_id, $title, $content, $image_url = '') {
 
 /**
  * Add Schema.org structured data (Article/NewsArticle)
+ * Schema is saved to post meta and output on single post pages
  */
 function frp_add_schema_markup($post_id, $title, $content, $image_url = '') {
     $post = get_post($post_id);
@@ -1494,17 +1590,33 @@ function frp_add_schema_markup($post_id, $title, $content, $image_url = '') {
         'articleSection' => $primary_category
     ];
     
-    // Add JSON-LD to post meta
-    $schema_json = json_encode($schema);
+    // Save schema to post meta - will be output when post is viewed
+    $schema_json = json_encode($schema, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     update_post_meta($post_id, '_frp_schema_markup', $schema_json);
     
-    // Add schema to wp_head
-    add_action('wp_head', function() use ($post_id, $schema_json) {
-        echo '<script type="application/ld+json">' . $schema_json . '</script>' . "\n";
-    });
-    
-    frp_log_message("  -> Schema.org markup added");
+    frp_log_message("  -> Schema.org markup saved");
 }
+
+/**
+ * Output Schema.org markup on single post pages
+ * This is the correct way to add schema - only when the post is being viewed
+ */
+function frp_output_schema_markup() {
+    // Only output on single posts
+    if (!is_single()) {
+        return;
+    }
+    
+    $post_id = get_the_ID();
+    
+    // Check if this is a FRP generated post
+    $schema_json = get_post_meta($post_id, '_frp_schema_markup', true);
+    
+    if (!empty($schema_json)) {
+        echo '<script type="application/ld+json">' . $schema_json . '</script>' . "\n";
+    }
+}
+add_action('wp_head', 'frp_output_schema_markup', 99);
 
 /**
  * Add Internal Links to generated content - SEO Optimized
