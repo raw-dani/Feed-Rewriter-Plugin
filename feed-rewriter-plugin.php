@@ -52,11 +52,14 @@ function frp_activate_plugin() {
     // Create log directory if not exists
     frp_create_log_directory();
     
-    // Schedule the main cron event
+    // Schedule individual crons for each feed with URL
+    frp_schedule_individual_crons();
+    
+    // Also keep main cron as fallback
     frp_schedule_main_cron();
     
     // Log activation
-    frp_log_message("Plugin activated v" . FRP_VERSION . ". Configure settings and click 'Run Now' to start.");
+    frp_log_message("Plugin activated v" . FRP_VERSION . ". Individual crons scheduled for feeds with URLs.");
 }
 register_activation_hook(__FILE__, 'frp_activate_plugin');
 
@@ -170,15 +173,32 @@ function frp_schedule_main_cron() {
  * Optimized to reduce database queries
  */
 function frp_register_cron_schedules($schedules = []) {
-    // Only add custom interval if not exists - prevents duplicate registration
-    if (empty($schedules)) {
-        $interval = get_option('frp_cron_interval', 60);
-        $interval = max(1, intval($interval));
-        
+    // Get the default global interval (used as fallback)
+    $default_interval = get_option('frp_cron_interval', 60);
+    $default_interval = max(1, intval($default_interval));
+    
+    // Register default custom interval if not exists
+    if (!isset($schedules['frp_custom_interval'])) {
         $schedules['frp_custom_interval'] = [
-            'interval' => $interval * 60,
-            'display'  => sprintf(__('Every %d minutes', 'feed-rewriter-plugin'), $interval)
+            'interval' => $default_interval * 60,
+            'display'  => sprintf(__('Every %d minutes', 'feed-rewriter-plugin'), $default_interval)
         ];
+    }
+    
+    // Register individual feed intervals dynamically
+    for ($i = 1; $i <= FRP_MAX_FEEDS; $i++) {
+        $feed_interval_key = 'frp_feed_interval_' . $i;
+        if (!isset($schedules[$feed_interval_key])) {
+            $feed_url = get_option("frp_feed_url_{$i}", '');
+            if (!empty($feed_url)) {
+                $feed_interval = get_option("frp_cron_interval_{$i}", $default_interval);
+                $feed_interval = max(1, intval($feed_interval));
+                $schedules[$feed_interval_key] = [
+                    'interval' => $feed_interval * 60,
+                    'display'  => sprintf(__('Feed #%d every %d minutes', 'feed-rewriter-plugin'), $i, $feed_interval)
+                ];
+            }
+        }
     }
     
     // Only add common intervals if not exists
@@ -208,63 +228,106 @@ function frp_register_cron_schedules($schedules = []) {
 add_filter('cron_schedules', 'frp_register_cron_schedules');
 
 // ==============================================================================
-// SECTION 4: MAIN CRON HANDLER
+// SECTION 4: MAIN CRON HANDLER + INDIVIDUAL FEED CRONS
 // ==============================================================================
 
 /**
  * Main cron event handler - processes all feeds
+ * This is the cron handler that receives timestamp from WordPress
  */
-add_action(FRP_CRON_HOOK, 'frp_process_all_feeds');
+add_action(FRP_CRON_HOOK, 'frp_cron_handler');
+
+function frp_cron_handler($timestamp) {
+    frp_log_message("=== CRON TRIGGERED: frp_cron_handler() called ===");
+    
+    // Call the main function with is_manual = false
+    frp_process_all_feeds(false);
+}
 
 /**
- * Process all configured feeds
+ * Individual cron handlers for each feed - runs independently
+ * Using separate function calls instead of closures to avoid PHP closure issues
  */
-function frp_process_all_feeds() {
-    // Check if already running
+add_action('frp_feed_cron_1', 'frp_feed_cron_handler_1');
+add_action('frp_feed_cron_2', 'frp_feed_cron_handler_2');
+add_action('frp_feed_cron_3', 'frp_feed_cron_handler_3');
+add_action('frp_feed_cron_4', 'frp_feed_cron_handler_4');
+add_action('frp_feed_cron_5', 'frp_feed_cron_handler_5');
+
+function frp_feed_cron_handler_1() { frp_process_single_feed_cron(1); }
+function frp_feed_cron_handler_2() { frp_process_single_feed_cron(2); }
+function frp_feed_cron_handler_3() { frp_process_single_feed_cron(3); }
+function frp_feed_cron_handler_4() { frp_process_single_feed_cron(4); }
+function frp_feed_cron_handler_5() { frp_process_single_feed_cron(5); }
+
+/**
+ * Process single feed from individual cron - independent execution
+ */
+function frp_process_single_feed_cron($config_num) {
+    $feed_url = get_option("frp_feed_url_{$config_num}", '');
+    
+    // Skip if feed URL is empty
+    if (empty($feed_url)) {
+        frp_log_message("INDIVIDUAL CRON #{$config_num}: Feed URL empty - skipping and clearing schedule");
+        // Clear this cron since feed has no URL
+        wp_clear_scheduled_hook("frp_feed_cron_{$config_num}");
+        return;
+    }
+    
+    frp_log_message("=== INDIVIDUAL CRON #{$config_num} TRIGGERED ===");
+    
+    // Check cron status
+    $status = get_option('frp_cron_status', 'inactive');
+    if ($status !== 'active') {
+        frp_log_message("Cron is paused - skipping feed #{$config_num}");
+        return;
+    }
+    
+    // CRITICAL FIX: Check interval BEFORE processing
+    // This prevents cron from running too frequently even if WordPress triggers it
+    $interval = get_option("frp_cron_interval_{$config_num}", 60);
+    $last_run = get_option("frp_last_run_config_{$config_num}", 0);
+    $time_since_last = time() - $last_run;
+    $interval_seconds = $interval * 60;
+    
+    if ($time_since_last < $interval_seconds) {
+        $remaining = $interval_seconds - $time_since_last;
+        frp_log_message("INDIVIDUAL CRON #{$config_num}: Interval not met yet ({$remaining}s remaining) - skipping");
+        // DO NOT reschedule - let the existing schedule handle it
+        return;
+    }
+    
+    // Check lock to prevent overlapping
     $lock_key = FRP_TRANSIENT_PREFIX . 'cron_running';
     if (get_transient($lock_key)) {
-        frp_log_message("Cron already running - skipping this execution");
+        frp_log_message("Cron already running - skipping feed #{$config_num}");
         return;
     }
     
     // Set lock
     set_transient($lock_key, true, 25 * MINUTE_IN_SECONDS);
     
-    // Check cron status
-    $status = get_option('frp_cron_status', 'inactive');
-    if ($status !== 'active') {
-        frp_log_message("Cron is paused - skipping execution");
-        delete_transient($lock_key);
-        return;
-    }
-    
-    // Validate API key
-    $api_key = get_option('frp_api_key');
-    if (empty($api_key)) {
-        frp_log_message("ERROR: OpenAI API key not configured");
-        delete_transient($lock_key);
-        return;
-    }
-    
     try {
-        $processed = 0;
+        $result = frp_process_single_feed_v2($config_num, false);
         
-        // Process each feed configuration
-        for ($config_num = 1; $config_num <= FRP_MAX_FEEDS; $config_num++) {
-            $result = frp_process_single_feed_v2($config_num);
-            if ($result) {
-                $processed++;
-                // Only process one article per cron run to avoid rate limiting
-                break;
-            }
-        }
-        
-        // Update last run time
-        if ($processed > 0) {
+        if ($result) {
             update_option('frp_last_cron_run', current_time('mysql'));
-            frp_log_message("Cron completed - {$processed} article(s) processed");
+            // Update the last run time to mark this execution
+            update_option("frp_last_run_config_{$config_num}", time());
+            frp_log_message("INDIVIDUAL CRON #{$config_num}: Article processed successfully - next run in {$interval} minutes");
+            
+            // CRITICAL FIX: Manually reschedule ONLY after successful article processing
+            // This ensures the cron waits for the correct interval
+            wp_clear_scheduled_hook("frp_feed_cron_{$config_num}");
+            $next_run = time() + $interval_seconds;
+            $schedule_name = 'frp_feed_interval_' . $config_num;
+            wp_schedule_event($next_run, $schedule_name, "frp_feed_cron_{$config_num}");
         } else {
-            frp_log_message("Cron completed - no articles processed");
+            // No article processed - DO NOT reschedule immediately
+            // Let the existing WordPress schedule handle it
+            // But also update last_run to prevent immediate re-trigger
+            update_option("frp_last_run_config_{$config_num}", time());
+            frp_log_message("INDIVIDUAL CRON #{$config_num}: No article processed - waiting for next scheduled run");
         }
         
     } catch (Exception $e) {
@@ -275,28 +338,157 @@ function frp_process_all_feeds() {
 }
 
 /**
- * Process a single feed configuration (optimized version)
+ * Schedule individual cron for each feed that has a URL
+ * Only schedules feeds with non-empty URLs
+ * Uses individual schedule per feed based on their configured interval
  */
-function frp_process_single_feed_v2($config_num) {
+function frp_schedule_individual_crons() {
+    // Ensure cron schedules are registered with correct intervals
+    // This will register individual feed intervals dynamically
+    apply_filters('cron_schedules', []);
+    
+    for ($i = 1; $i <= FRP_MAX_FEEDS; $i++) {
+        $feed_url = get_option("frp_feed_url_{$i}", '');
+        
+        // Only schedule if feed URL is not empty
+        if (!empty($feed_url)) {
+            $interval = get_option("frp_cron_interval_{$i}", 60);
+            $interval = max(1, intval($interval));
+            
+            // Clear existing schedule first
+            wp_clear_scheduled_hook("frp_feed_cron_{$i}");
+            
+            // Use individual feed-specific schedule
+            $schedule_name = 'frp_feed_interval_' . $i;
+            
+            // First ensure the schedule is registered
+            $schedules = wp_get_schedules();
+            if (!isset($schedules[$schedule_name])) {
+                // Register this feed's interval dynamically
+                add_filter('cron_schedules', function($schedules) use ($i, $interval) {
+                    $schedules['frp_feed_interval_' . $i] = [
+                        'interval' => $interval * 60,
+                        'display'  => sprintf(__('Feed #%d every %d minutes', 'feed-rewriter-plugin'), $i, $interval)
+                    ];
+                    return $schedules;
+                });
+            }
+            
+            // Schedule new event with individual interval
+            $next_run = time() + ($interval * 60);
+            wp_schedule_event($next_run, $schedule_name, "frp_feed_cron_{$i}");
+            
+            frp_log_message("Scheduled individual cron for Feed #{$i}: every {$interval} minutes");
+        } else {
+            // Clear cron if feed URL is empty
+            wp_clear_scheduled_hook("frp_feed_cron_{$i}");
+            frp_log_message("Feed #{$i} has no URL - cron excluded");
+        }
+    }
+}
+
+/**
+ * Process all configured feeds
+ * @param bool $is_manual - true if called from manual run button
+ */
+function frp_process_all_feeds($is_manual = false) {
+    // Check if already running
+    $lock_key = FRP_TRANSIENT_PREFIX . 'cron_running';
+    
+    // For manual runs, skip the lock check entirely to allow immediate execution
+    // For cron, use the lock to prevent overlapping runs
+    if (!$is_manual && get_transient($lock_key)) {
+        frp_log_message("Cron already running - skipping this execution");
+        return;
+    }
+    
+    // Set lock only for cron jobs, not for manual runs
+    if (!$is_manual) {
+        set_transient($lock_key, true, 25 * MINUTE_IN_SECONDS);
+    }
+    
+    // Check cron status (skip for manual runs)
+    $status = get_option('frp_cron_status', 'inactive');
+    if (!$is_manual && $status !== 'active') {
+        frp_log_message("Cron is paused - skipping execution");
+        if (!$is_manual) delete_transient($lock_key);
+        return;
+    }
+    
+    // Validate API key
+    $api_key = get_option('frp_api_key');
+    if (empty($api_key)) {
+        frp_log_message("ERROR: OpenAI API key not configured");
+        if (!$is_manual) delete_transient($lock_key);
+        return;
+    }
+    
+    try {
+        $processed = 0;
+        
+        // Process each feed configuration
+        for ($config_num = 1; $config_num <= FRP_MAX_FEEDS; $config_num++) {
+            // Pass is_manual parameter to allow immediate execution for manual runs
+            $result = frp_process_single_feed_v2($config_num, $is_manual);
+            if ($result) {
+                $processed++;
+                // Only process one article per cron run to avoid rate limiting
+                // For manual runs, we still process one at a time for consistency
+                break;
+            }
+        }
+        
+        // Update last run time
+        if ($processed > 0) {
+            update_option('frp_last_cron_run', current_time('mysql'));
+            frp_log_message($is_manual ? "Manual run completed - {$processed} article(s) processed" : "Cron completed - {$processed} article(s) processed");
+        } else {
+            frp_log_message($is_manual ? "Manual run completed - no articles processed (check feed URLs and settings)" : "Cron completed - no articles processed");
+        }
+        
+    } catch (Exception $e) {
+        frp_log_message("ERROR: " . $e->getMessage());
+    } finally {
+        // Only delete lock if it was set (i.e., for cron jobs)
+        if (!$is_manual) {
+            delete_transient($lock_key);
+        }
+    }
+}
+
+/**
+ * Process a single feed configuration (optimized version)
+ * @param int $config_num - Feed configuration number
+ * @param bool $is_manual - true if called from manual run button
+ */
+function frp_process_single_feed_v2($config_num, $is_manual = false) {
     $feed_url = get_option("frp_feed_url_{$config_num}", '');
     
     if (empty($feed_url)) {
         return false;
     }
     
-    // Check if it's time to process this feed
-    $interval = get_option("frp_cron_interval_{$config_num}", 60);
-    $last_run = get_option("frp_last_run_config_{$config_num}", 0);
-    
-    if (time() - $last_run < ($interval * 60)) {
-        return false;
+    // Check if it's time to process this feed (skip for manual runs)
+    // Note: This check is also done in frp_process_single_feed_cron() for individual crons
+    // but kept here for the main cron handler and as a safety measure
+    if (!$is_manual) {
+        $interval = get_option("frp_cron_interval_{$config_num}", 60);
+        $last_run = get_option("frp_last_run_config_{$config_num}", 0);
+        
+        if (time() - $last_run < ($interval * 60)) {
+            return false;
+        }
+    } else {
+        // For manual runs, always update the last run time to track execution
+        update_option("frp_last_run_config_{$config_num}", time());
     }
     
     // Get settings
     $category = get_option("frp_selected_category_{$config_num}", '');
     $custom_prompt = get_option("frp_custom_prompt_{$config_num}", 'Rewrite the following content:');
     
-    frp_log_message("Processing Feed #{$config_num}: " . substr($feed_url, 0, 40) . "...");
+    $source_type = $is_manual ? 'MANUAL' : 'CRON';
+    frp_log_message("Processing Feed #{$config_num} [{$source_type}]: " . substr($feed_url, 0, 40) . "...");
     
     // Fetch feed
     $response = wp_remote_get($feed_url, [
@@ -782,8 +974,13 @@ function frp_rewrite_with_enhanced_research($title, $content, $custom_prompt, $a
         "The article should be informative, engaging, and suitable for publishing. " .
         "Use the additional research data to enrich the content with more information and insights. " .
         "Ensure the title is concise (max 65 characters) and engaging. " .
-        "The content should be well-structured with proper headings (use <h2> for main sections). " .
-        "Do NOT use labels like 'Title:' or 'Content:'. " .
+        "IMPORTANT FORMATTING RULES:\n" .
+        "- Use <h2> for main section headings (do NOT add 'H2:' prefix, just the heading text)\n" .
+        "- Use <h3> for subsections (do NOT add 'H3:' prefix, just the heading text)\n" .
+        "- Do NOT use markdown (##, ###) - use HTML tags directly\n" .
+        "- Do NOT include 'Meta Description:' in the content\n" .
+        "- Do NOT use labels like 'Title:' or 'Content:'\n" .
+        "- Do NOT add heading numbers like 'H2:' or 'H3:' inside the heading text\n" .
         "Write in " . ($language === 'id' ? 'Bahasa Indonesia' : 'English') . ".\n\n" .
         "Title: {$title}\n\n" .
         "Main Content:\n{$content}" .
@@ -821,6 +1018,7 @@ function frp_rewrite_with_enhanced_research($title, $content, $custom_prompt, $a
     $parts = explode("\n\n", $text, 2);
     
     $clean_title = trim($parts[0]);
+    $clean_title = preg_replace('/^#+\s*/', '', $clean_title); // Remove markdown headings like ## 
     $clean_title = preg_replace('/^(Title:|Judul:)\s*/i', '', $clean_title);
     $clean_title = trim($clean_title, '"\'');
     
@@ -883,7 +1081,13 @@ function frp_rewrite_with_openai($title, $content, $custom_prompt) {
     $prompt = "{$custom_prompt}\n\n" .
         "Rewrite the following title and content to make it suitable for publishing. " .
         "Ensure the title is concise (max 65 characters) and engaging. " .
-        "The content should be well-structured without labels like 'Title:' or 'Content:'. " .
+        "IMPORTANT FORMATTING RULES:\n" .
+        "- Use <h2> for main section headings (do NOT add 'H2:' prefix, just the heading text)\n" .
+        "- Use <h3> for subsections (do NOT add 'H3:' prefix, just the heading text)\n" .
+        "- Do NOT use markdown (##, ###) - use HTML tags directly\n" .
+        "- Do NOT include 'Meta Description:' in the content\n" .
+        "- Do NOT use labels like 'Title:' or 'Content:'\n" .
+        "- Do NOT add heading numbers like 'H2:' or 'H3:' inside the heading text\n" .
         "Write in " . ($language === 'id' ? 'Bahasa Indonesia' : 'English') . ".\n\n" .
         "Title: {$title}\n\n" .
         "Content:\n{$content}";
@@ -918,6 +1122,7 @@ function frp_rewrite_with_openai($title, $content, $custom_prompt) {
     $parts = explode("\n\n", $text, 2);
     
     $clean_title = trim($parts[0]);
+    $clean_title = preg_replace('/^#+\s*/', '', $clean_title); // Remove markdown headings like ## 
     $clean_title = preg_replace('/^(Title:|Judul:)\s*/i', '', $clean_title);
     $clean_title = trim($clean_title, '"\'');
     
@@ -931,12 +1136,44 @@ function frp_rewrite_with_openai($title, $content, $custom_prompt) {
 }
 
 /**
- * Clean output content - add TOC, formatting, etc. (Google SEO Optimized)
+ * Clean output content
  */
 function frp_clean_output_content($content) {
-    // Convert markdown
-    $content = preg_replace('/^###\s+(.*)$/m', '<h2>$1</h2>', $content);
+    // Remove Meta Description lines (various formats)
+    $content = preg_replace('/^<strong>Meta Description:<\/strong>.*$/im', '', $content);
+    $content = preg_replace('/^Meta Description:.*$/im', '', $content);
+    $content = preg_replace('/^\*\*Meta Description:\*\*.*$/im', '', $content);
+    
+    // Remove FAQ headers that might be included by mistake
+    $content = preg_replace('/^<h2>\s*FAQ\s*<\/h2>$/im', '<h2>FAQ</h2>', $content);
+    
+    // Convert H4 markdown (####) to h3 tags - must be before H2/H3 processing
+    $content = preg_replace('/^####\s*(?:H3:\s*)?(.*)$/m', '<h3>$1</h3>', $content);
+    
+    // Convert H3 markdown (###) to h3 tags (not h2!)
+    $content = preg_replace('/^###\s*(?:H2:\s*)?(.*)$/m', '<h3>$1</h3>', $content);
+    
+    // Convert H2 markdown (##) to h2 tags (remove "H2:" prefix if present)
+    $content = preg_replace('/^##\s*(?:H2:\s*)?(.*)$/m', '<h2>$1</h2>', $content);
+    
+    // Convert single # markdown to h2 tags
+    $content = preg_replace('/^#\s*(?!#)(.*)$/m', '<h2>$1</h2>', $content);
+    
+    // Clean up any remaining H2: or H3: prefixes in already converted HTML headings
+    $content = preg_replace('/<h2>\s*H2:\s*/i', '<h2>', $content);
+    $content = preg_replace('/<h3>\s*H3:\s*/i', '<h3>', $content);
+    
+    // Clean up heading tags that might have redundant text like "H2: Title" -> "Title"
+    $content = preg_replace('/<(h[23])>\s*H[23]:\s*/i', '<$1>', $content);
+    
+    // Convert bold markdown
     $content = preg_replace('/\*\*(.*?)\*\*/', '<strong>$1</strong>', $content);
+    
+    // Clean up multiple empty lines (more than 2 consecutive)
+    $content = preg_replace('/\n{3,}/', "\n\n", $content);
+    
+    // Trim whitespace from beginning and end
+    $content = trim($content);
     
     // Add TOC if enabled - Google SEO Optimized Version
     if (get_option('frp_enable_toc', 'yes') === 'yes') {
@@ -1230,13 +1467,74 @@ function frp_render_settings_page() {
         echo '<div class="notice notice-success"><p><strong>▶️ Resumed:</strong> All cron jobs have been resumed. Plugin is now active.</p></div>';
     }
     
-    // Handle form submission
+    // Handle form submission - Run Now button
     if (isset($_POST['frp_run_now']) && check_admin_referer('frp_manual_run')) {
-        delete_transient(FRP_TRANSIENT_PREFIX . 'cron_running');
-        frp_log_message("=== MANUAL EXECUTION STARTED ===");
-        frp_process_all_feeds();
-        frp_log_message("=== MANUAL EXECUTION COMPLETED ===");
-        echo '<div class="notice notice-success"><p>Manual execution completed.</p></div>';
+        // FIX 1: Anti-double click protection
+        $manual_lock_key = FRP_TRANSIENT_PREFIX . 'manual_running';
+        if (get_transient($manual_lock_key)) {
+            echo '<div class="notice notice-warning"><p>⚠️ Process is already running. Please wait for it to complete or click "Clear Lock" if stuck.</p></div>';
+        } else {
+            // Set manual lock for 2 minutes to prevent double clicks
+            set_transient($manual_lock_key, true, 2 * MINUTE_IN_SECONDS);
+            
+            // Force clear cron lock to allow immediate re-run
+            delete_transient(FRP_TRANSIENT_PREFIX . 'cron_running');
+            
+            // FIX 2: Validasi API key sebelum eksekusi
+            $api_key = get_option('frp_api_key');
+            if (empty($api_key)) {
+                frp_log_message("ERROR: Cannot run manually - OpenAI API key not configured!");
+                echo '<div class="notice notice-error"><p>❌ ERROR: OpenAI API Key not configured. Please save your API key in settings first.</p></div>';
+                delete_transient($manual_lock_key);
+            } else {
+                // FIX 3: Validasi Feed URL
+                $has_feeds = false;
+                for ($i = 1; $i <= FRP_MAX_FEEDS; $i++) {
+                    if (!empty(get_option("frp_feed_url_{$i}"))) {
+                        $has_feeds = true;
+                        break;
+                    }
+                }
+                
+                if (!$has_feeds) {
+                    frp_log_message("ERROR: Cannot run manually - No feed URLs configured!");
+                    echo '<div class="notice notice-error"><p>❌ ERROR: No feed URLs configured. Please add at least one feed URL in settings.</p></div>';
+                    delete_transient($manual_lock_key);
+                } else {
+                    // FIX 4: Log dengan source indicator yang benar
+                    frp_log_message("=== MANUAL EXECUTION STARTED (User clicked Run Now) ===", true);
+                    
+                    frp_log_message("Calling frp_process_all_feeds(true)...", true);
+                    
+                    // FIX 5: Catch Throwable instead of Exception
+                    try {
+                        frp_process_all_feeds(true);
+                        frp_log_message("frp_process_all_feeds() completed", true);
+                        
+                        // Success message
+                        echo '<div class="notice notice-success"><p>✅ Manual execution completed. Check logs below for details.</p></div>';
+                        
+                    } catch (Throwable $e) {
+                        $error_msg = "ERROR: " . $e->getMessage();
+                        frp_log_message($error_msg, true);
+                        echo '<div class="notice notice-error"><p>❌ ' . esc_html($error_msg) . '</p></div>';
+                    }
+                    
+                    frp_log_message("=== MANUAL EXECUTION COMPLETED ===", true);
+                    
+                    // FIX 6: Clear manual lock after completion
+                    delete_transient($manual_lock_key);
+                }
+            }
+        }
+        
+        // FIX 7: Redirect untuk clear POST data dan mencegah double submission
+        echo '<script>setTimeout(function(){ window.location.href = window.location.href.split("?")[0] + "?page=frp_settings&frp_notice=success"; }, 1500);</script>';
+    }
+    
+    // Tampilkan notice dari redirect jika ada
+    if (isset($_GET['frp_notice']) && $_GET['frp_notice'] === 'success') {
+        echo '<div class="notice notice-success is-dismissible"><p>✅ Manual execution completed successfully!</p></div>';
     }
     
     if (isset($_POST['frp_clear_lock']) && check_admin_referer('frp_manual_run')) {
@@ -1269,50 +1567,37 @@ function frp_render_settings_page() {
         }
         ?>
         
-        <!-- Cron Control Panel -->
+        <!-- Cron Control Panel - SEPARATE FORM from settings -->
         <div class="postbox" style="margin: 20px 0; padding: 15px;">
             <h2 style="margin-top: 0;">🤖 Plugin Control Panel</h2>
             
-            <div style="display: flex; gap: 15px; flex-wrap: wrap; align-items: center;">
-                <?php if ($is_paused) : ?>
-                    <!-- Resume Button -->
-                    <form method="post" style="display: inline;">
-                        <?php wp_nonce_field('frp_cron_control'); ?>
+            <form method="post" action="">
+                <?php wp_nonce_field('frp_manual_run'); ?>
+                
+                <div style="display: flex; gap: 15px; flex-wrap: wrap; align-items: center;">
+                    <?php if ($is_paused) : ?>
                         <button type="submit" name="frp_resume_all" class="button button-primary" style="font-size: 14px; padding: 8px 20px; height: auto;">
                             ▶️ Resume All Cron Jobs
                         </button>
-                    </form>
-                <?php else : ?>
-                    <!-- Pause Button -->
-                    <form method="post" style="display: inline;">
-                        <?php wp_nonce_field('frp_cron_control'); ?>
+                    <?php else : ?>
                         <button type="submit" name="frp_pause_all" class="button button-secondary" style="font-size: 14px; padding: 8px 20px; height: auto; color: #b32d2e; border-color: #b32d2e;">
                             ⏸️ Pause All Cron Jobs
                         </button>
-                    </form>
-                <?php endif; ?>
-                
-                <!-- Manual Run -->
-                <form method="post" style="display: inline;">
-                    <?php wp_nonce_field('frp_manual_run'); ?>
-                    <button type="submit" name="frp_run_now" class="button" style="font-size: 14px; padding: 8px 20px; height: auto;" <?php echo $is_paused ? '' : ''; ?>>
-                        🔄 Run Now (Manual)
+                    <?php endif; ?>
+                    
+                    <button type="submit" name="frp_run_now" class="button button-primary" style="font-size: 16px; padding: 12px 30px; height: auto; background: #28a745; border-color: #28a745;">
+                        🔄 RUN NOW - Process Feeds
                     </button>
-                </form>
-                
-                <!-- Clear Lock -->
-                <form method="post" style="display: inline;">
-                    <?php wp_nonce_field('frp_manual_run'); ?>
-                    <button type="submit" name="frp_clear_lock" class="button button-link" style="color: #666;">
+                    
+                    <button type="submit" name="frp_clear_lock" class="button" style="color: #666;">
                         🔓 Clear Lock
                     </button>
-                </form>
-            </div>
+                </div>
+            </form>
             
             <p class="description" style="margin-top: 15px;">
-                <strong>Pause:</strong> Menonaktifkan semua jadwal cron tanpa menonaktifkan plugin. 
-                Berguna untuk menghemat resource hosting atau saat maintenance.<br>
-                <strong>Resume:</strong> Mengaktifkan kembali semua jadwal cron.
+                <strong>Run Now:</strong> Langsung eksekusi feed processing tanpa menunggu cron.<br>
+                <strong>Pause/Resume:</strong> Mengaktifkan atau menonaktifkan jadwal cron otomatis.
             </p>
         </div>
         
@@ -1369,6 +1654,26 @@ function frp_render_settings_page() {
             echo '<td>' . ($frp_cron_found ? '<span style="color: #46b450;">Yes ✓</span>' : '<span style="color: #dc3232;">No ✗</span>') . '</td>';
             echo '</tr>';
             
+            // Show individual feed cron status
+            echo '<tr>';
+            echo '<td><strong>Individual Feed Crons:</strong></td>';
+            echo '<td>';
+            for ($i = 1; $i <= FRP_MAX_FEEDS; $i++) {
+                $feed_url = get_option("frp_feed_url_{$i}", '');
+                if (!empty($feed_url)) {
+                    $next_feed_run = wp_next_scheduled("frp_feed_cron_{$i}");
+                    if ($next_feed_run) {
+                        echo "Feed #{$i}: " . human_time_diff(time(), $next_feed_run) . "<br>";
+                    } else {
+                        echo "Feed #{$i}: <span style='color: #dc3232;'>Not scheduled</span><br>";
+                    }
+                } else {
+                    echo "Feed #{$i}: <span style='color: #999;'>Empty (excluded)</span><br>";
+                }
+            }
+            echo '</td>';
+            echo '</tr>';
+            
             // Show lock status
             $lock = get_transient(FRP_TRANSIENT_PREFIX . 'cron_running');
             echo '<tr>';
@@ -1398,8 +1703,13 @@ function frp_pause_all_crons() {
     // Update status to paused
     update_option('frp_cron_status', 'paused');
     
-    // Clear the scheduled cron
+    // Clear the main scheduled cron
     wp_clear_scheduled_hook(FRP_CRON_HOOK);
+    
+    // Clear all individual feed crons
+    for ($i = 1; $i <= FRP_MAX_FEEDS; $i++) {
+        wp_clear_scheduled_hook("frp_feed_cron_{$i}");
+    }
     
     // Clear any running lock
     delete_transient(FRP_TRANSIENT_PREFIX . 'cron_running');
@@ -1417,10 +1727,13 @@ function frp_resume_all_crons() {
     // Reschedule the main cron
     frp_schedule_main_cron();
     
+    // Reschedule individual feed crons
+    frp_schedule_individual_crons();
+    
     // Clear any stale lock
     delete_transient(FRP_TRANSIENT_PREFIX . 'cron_running');
     
-    frp_log_message("▶️ All cron jobs RESUMED by user - plugin is now active");
+    frp_log_message("▶️ All cron jobs RESUMED by user - individual crons scheduled");
 }
 
 /**
@@ -1838,8 +2151,10 @@ function frp_add_internal_links($post_id, $content, $category_id = '') {
 
 /**
  * Enhanced logging function with rotation
+ * @param string $message - Log message
+ * @param bool $is_manual - Explicit override for manual mode
  */
-function frp_log_message($message) {
+function frp_log_message($message, $is_manual = null) {
     static $last_message = '';
     static $last_time = 0;
     
@@ -1860,7 +2175,17 @@ function frp_log_message($message) {
     }
     
     $timestamp = current_time('mysql');
-    $source = defined('DOING_CRON') && DOING_CRON ? '[CRON]' : '[MANUAL]';
+    
+    // FIX: Explicit source indicator - jika parameter $is_manual diset
+    if ($is_manual === true) {
+        $source = '[MANUAL]';
+    } elseif ($is_manual === false) {
+        $source = '[CRON]';
+    } else {
+        // Fallback to auto-detect
+        $source = defined('DOING_CRON') && DOING_CRON ? '[CRON]' : '[MANUAL]';
+    }
+    
     $entry = "[{$timestamp}] {$source} {$message}\n";
     
     file_put_contents(FRP_LOG_FILE, $entry, FILE_APPEND);
@@ -1872,6 +2197,8 @@ function frp_log_message($message) {
 function frp_on_settings_change() {
     if (get_option('frp_cron_status', 'active') === 'active') {
         frp_schedule_main_cron();
+        // Also reschedule individual feed crons
+        frp_schedule_individual_crons();
     } else {
         wp_clear_scheduled_hook(FRP_CRON_HOOK);
     }
@@ -1883,6 +2210,12 @@ add_action('update_option_frp_feed_url_2', 'frp_on_settings_change');
 add_action('update_option_frp_feed_url_3', 'frp_on_settings_change');
 add_action('update_option_frp_feed_url_4', 'frp_on_settings_change');
 add_action('update_option_frp_feed_url_5', 'frp_on_settings_change');
+// Also trigger on individual feed interval changes
+add_action('update_option_frp_cron_interval_1', 'frp_on_settings_change');
+add_action('update_option_frp_cron_interval_2', 'frp_on_settings_change');
+add_action('update_option_frp_cron_interval_3', 'frp_on_settings_change');
+add_action('update_option_frp_cron_interval_4', 'frp_on_settings_change');
+add_action('update_option_frp_cron_interval_5', 'frp_on_settings_change');
 
 // ==============================================================================
 // SECTION 9: ADMIN NOTICES & SYSTEM CHECK
