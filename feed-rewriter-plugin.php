@@ -64,6 +64,319 @@ function frp_activate_plugin() {
 register_activation_hook(__FILE__, 'frp_activate_plugin');
 
 /**
+ * Detect if feed is in Blogger text format (non-XML)
+ * Returns true if feed starts with 'tag:blogger.com'
+ */
+function frp_is_blogger_text_format($content) {
+    $trimmed = trim($content);
+    return (strpos($trimmed, 'tag:blogger.com') === 0);
+}
+
+/**
+ * Parse Blogger text format feed
+ * This format is not XML - it's a plain text representation
+ */
+function frp_parse_blogger_text_format($content) {
+    $items = [];
+    
+    // Split content by entry markers (posts start with 'tag:blogger.com,1999:blog-....post-')
+    // But we need to first get blog info, then posts
+    
+    $lines = explode("\n", $content);
+    $current_item = [];
+    $in_content = false;
+    $content_lines = [];
+    $found_first_entry = false;
+    
+    foreach ($lines as $line) {
+        $line = rtrim($line); // Remove trailing \r if present
+        
+        // Skip empty lines
+        if (empty($line)) {
+            continue;
+        }
+        
+        // Check if this is a new post entry (starts with 'tag:blogger.com,1999:blog-' followed by date or 'post-')
+        if (preg_match('/^tag:blogger\.com,1999:blog-[0-9]+(-[0-9T:.+-]+)?\.post-/', $line)) {
+            // Save previous item if exists
+            if (!empty($current_item) && !empty($content_lines)) {
+                $current_item['content'] = implode("\n", $content_lines);
+                $items[] = $current_item;
+            }
+            
+            // Start new item
+            $current_item = ['id' => $line];
+            $content_lines = [];
+            $in_content = false;
+            $found_first_entry = true;
+            continue;
+        }
+        
+        // If we haven't found first entry yet, this is blog header info
+        if (!$found_first_entry) {
+            continue; // Skip blog-level info for now
+        }
+        
+        // Try to parse fields based on patterns
+        if (!$in_content && isset($current_item['id'])) {
+            // Published date: YYYY-MM-DDThh:mm:ss.000-XX:00
+            if (preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[.-]/', $line)) {
+                if (!isset($current_item['published'])) {
+                    $current_item['published'] = $line;
+                } else {
+                    $current_item['updated'] = $line;
+                }
+                continue;
+            }
+            
+            // Title - single line, not containing http:// or <
+            if (!isset($current_item['title']) && 
+                !isset($current_item['content']) &&
+                strpos($line, 'http') !== 0 &&
+                strpos($line, '<') !== 0 &&
+                strlen($line) > 3 &&
+                strlen($line) < 200) {
+                $current_item['title'] = $line;
+                $in_content = true; // After title, everything is content
+                continue;
+            }
+            
+            // If we have title and this looks like content
+            if (isset($current_item['title'])) {
+                $content_lines[] = $line;
+                continue;
+            }
+        }
+        
+        // After content, look for author info pattern
+        if (!empty($content_lines) && !isset($current_item['author'])) {
+            // Check if this looks like author name (no http, no tags, reasonable length)
+            if (strpos($line, 'http') !== 0 && 
+                strpos($line, '<') === false &&
+                strlen($line) > 1 &&
+                strlen($line) < 100 &&
+                !preg_match('/^\d+$/', $line)) {
+                $current_item['author'] = $line;
+                continue;
+            }
+            
+            // Author profile URL
+            if (isset($current_item['author']) && strpos($line, 'http://www.blogger.com/profile/') === 0) {
+                $current_item['author_url'] = $line;
+                continue;
+            }
+            
+            // Author email
+            if (isset($current_item['author_url']) && strpos($line, '@blogger.com') !== false) {
+                $current_item['author_email'] = $line;
+                // This is usually end of entry
+                // Save content accumulated so far
+                if (!empty($content_lines)) {
+                    // Remove author info from content lines
+                    $content_lines = array_slice($content_lines, 0, -2); // Remove author name and URL lines
+                    if (!empty($content_lines)) {
+                        $current_item['content'] = implode("\n", $content_lines);
+                    }
+                }
+                continue;
+            }
+        }
+        
+        // Continue accumulating content
+        if ($in_content && isset($current_item['title'])) {
+            $content_lines[] = $line;
+        }
+    }
+    
+    // Don't forget last item
+    if (!empty($current_item) && !empty($content_lines)) {
+        if (!isset($current_item['content'])) {
+            $current_item['content'] = implode("\n", $content_lines);
+        }
+        $items[] = $current_item;
+    }
+    
+    return $items;
+}
+
+/**
+ * Extract image from Blogger content (HTML)
+ */
+function frp_extract_image_from_blogger_content($content) {
+    if (empty($content)) {
+        return '';
+    }
+    
+    // Try to find img tags in content
+    if (preg_match('/<img[^>]+src="([^"]+)"/', $content, $matches)) {
+        return $matches[1];
+    }
+    
+    // Try og:image in JSON-LD content
+    if (preg_match('/"og:image"\s*:\s*"([^"]+)"/', $content, $matches)) {
+        return $matches[1];
+    }
+    
+    return '';
+}
+
+/**
+ * Extract feed content from Blogger text format item
+ */
+function frp_extract_feed_content_from_blogger($item) {
+    $content = '';
+    
+    if (isset($item['content'])) {
+        // Strip HTML tags but keep line breaks
+        $content = strip_tags(html_entity_decode($item['content']));
+        // Clean up
+        $content = preg_replace('/The post .* appeared first on .*\./s', '', $content);
+    }
+    
+    return trim($content);
+}
+
+/**
+ * Extract image from Blogger text format item
+ */
+function frp_extract_image_from_blogger_item($item) {
+    // First try from content
+    if (isset($item['content'])) {
+        $image = frp_extract_image_from_blogger_content($item['content']);
+        if (!empty($image)) {
+            return $image;
+        }
+    }
+    
+    return '';
+}
+
+/**
+ * Process Blogger text format feed
+ * Handles the non-XML Blogger export format
+ */
+function frp_process_blogger_text_feed($config_num, $body, $feed_url, $category, $custom_prompt, $is_manual) {
+    // Parse the Blogger text format
+    $items = frp_parse_blogger_text_format($body);
+    
+    if (empty($items)) {
+        frp_log_message("No items found in Blogger text format feed");
+        return false;
+    }
+    
+    frp_log_message("Found " . count($items) . " items in Blogger text format feed");
+    
+    // Get settings
+    $processed_urls = get_option("frp_processed_urls_{$config_num}", []);
+    $ignore_processed = get_option('frp_ignore_processed_urls', '1');
+    $max_items = apply_filters('frp_max_feed_items', 10);
+    
+    $item_count = 0;
+    foreach ($items as $item) {
+        $item_count++;
+        if ($item_count > $max_items) {
+            frp_log_message("Reached max items limit ({$max_items})");
+            break;
+        }
+        
+        // Use item ID as unique identifier (Blogger format)
+        $item_id = isset($item['id']) ? $item['id'] : '';
+        
+        // Skip already processed
+        if ($ignore_processed === '1' && in_array($item_id, $processed_urls)) {
+            continue;
+        }
+        
+        // Get content
+        $content = frp_extract_feed_content_from_blogger($item);
+        $title = isset($item['title']) ? $item['title'] : 'Untitled';
+        
+        if (empty($content) || strlen($content) < 100) {
+            continue;
+        }
+        
+        // Check keyword filters
+        if (!frp_check_keyword_filters($title, $content)) {
+            continue;
+        }
+        
+        // Build article URL from ID if possible
+        $link = '';
+        if (preg_match('/blog-([0-9]+)\.post-([0-9]+)/', $item_id, $matches)) {
+            $link = 'https://workspaceupdates.googleblog.com/' . date('Y/m/d') . '/post-' . $matches[2] . '.html';
+        }
+        
+        // Check if enhanced research is enabled
+        if (get_option('frp_enable_enhanced_research', '1') === '1') {
+            frp_log_message("  -> Using Enhanced Research Mode for article rewriting");
+            $rewritten = frp_rewrite_with_enhanced_research($title, $content, $custom_prompt, $link);
+        } else {
+            $rewritten = frp_rewrite_with_openai($title, $content, $custom_prompt);
+        }
+        
+        if (!$rewritten) {
+            continue;
+        }
+        
+        // Create post
+        $post_id = wp_insert_post([
+            'post_title' => $rewritten['title'],
+            'post_content' => $rewritten['content'],
+            'post_status' => 'publish',
+            'post_type' => 'post',
+            'post_category' => $category ? [$category] : [],
+            'meta_input' => [
+                '_frp_generated' => 1,
+                '_frp_source_feed' => $feed_url,
+                '_frp_source_link' => $link,
+                '_frp_config_num' => $config_num
+            ],
+        ]);
+        
+        if ($post_id) {
+            // Set featured image - try to extract from content
+            $image_url = frp_extract_image_from_blogger_item($item);
+            
+            // If no image from content, try to get from article URL
+            if (empty($image_url) && !empty($link)) {
+                $image_url = frp_extract_image_from_url($link);
+            }
+            
+            if ($image_url) {
+                frp_set_post_thumbnail($post_id, $image_url);
+            }
+            
+            // Generate tags only if enabled
+            $enable_tags = get_option('frp_enable_tags', '1');
+            if ($enable_tags === '1') {
+                $tags = frp_generate_post_tags($rewritten['content']);
+                if (!empty($tags)) {
+                    wp_set_post_tags($post_id, $tags);
+                }
+            }
+            
+            // Add SEO optimizations
+            frp_add_seo_meta($post_id, $rewritten['title'], $rewritten['content'], $image_url);
+            
+            // Add Schema.org structured data
+            frp_add_schema_markup($post_id, $rewritten['title'], $rewritten['content'], $image_url);
+            
+            // Update processed URLs - use item ID
+            if (!empty($item_id)) {
+                $processed_urls[] = $item_id;
+                update_option("frp_processed_urls_{$config_num}", $processed_urls);
+            }
+            update_option("frp_last_run_config_{$config_num}", time());
+            
+            frp_log_message("SUCCESS: Created post #{$post_id}");
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+/**
  * Consolidated deactivation hook - handles all plugin cleanup
  */
 function frp_deactivate_plugin() {
@@ -494,6 +807,7 @@ function frp_process_single_feed_v2($config_num, $is_manual = false) {
     $response = wp_remote_get($feed_url, [
         'timeout' => 15,
         'user-agent' => 'Mozilla/5.0 (WordPress Feed Reader)',
+        'redirection' => 5, // Follow redirects
     ]);
     
     if (is_wp_error($response)) {
@@ -501,12 +815,56 @@ function frp_process_single_feed_v2($config_num, $is_manual = false) {
         return false;
     }
     
+    // Check HTTP response code
+    $response_code = wp_remote_retrieve_response_code($response);
+    if ($response_code !== 200) {
+        frp_log_message("Feed HTTP error: Response code " . $response_code);
+        return false;
+    }
+    
     $body = wp_remote_retrieve_body($response);
+    
+    // Debug: Log first 500 chars of response
+    frp_log_message("DEBUG: Feed response starts with: " . substr($body, 0, 500));
+    
+    // Check if feed is in Blogger text format (non-XML)
+    if (frp_is_blogger_text_format($body)) {
+        frp_log_message("Detected Blogger text format feed - using text parser");
+        return frp_process_blogger_text_feed($config_num, $body, $feed_url, $category, $custom_prompt, $is_manual);
+    }
+    
+    // Try XML parsing for standard RSS/Atom feeds
     $xml = @simplexml_load_string($body);
     
-    if (!$xml || !isset($xml->channel)) {
-        frp_log_message("Invalid feed XML");
+    if (!$xml) {
+        $xml_error = libxml_get_last_error();
+        $xml_error_msg = $xml_error ? $xml_error->message : 'No XML error details';
+        frp_log_message("Invalid feed XML - libxml error: " . $xml_error_msg);
+        frp_log_message("Invalid feed XML - body length: " . strlen($body) . ", first 300 chars: " . substr($body, 0, 300));
         return false;
+    }
+    
+    // Check if it's RSS (channel) or Atom (feed) format
+    $is_atom = false;
+    if (isset($xml->channel)) {
+        // RSS format
+        $is_atom = false;
+    } elseif (isset($xml->entry)) {
+        // Atom format with entries directly in feed
+        $is_atom = true;
+    } elseif (isset($xml->feed)) {
+        // Atom format with feed element
+        $is_atom = true;
+    } else {
+        frp_log_message("Invalid feed XML - no channel or entry element found. Root element: " . ($xml->getName() ?? 'unknown'));
+        return false;
+    }
+    
+    frp_log_message("Detected " . ($is_atom ? "Atom" : "RSS") . " feed format");
+    
+    // Process based on format
+    if ($is_atom) {
+        return frp_process_atom_feed($config_num, $xml, $feed_url, $category, $custom_prompt, $is_manual);
     }
     
     // Process items - limit to first 10 items for performance
@@ -601,6 +959,169 @@ function frp_process_single_feed_v2($config_num, $is_manual = false) {
             // Update processed URLs
             $processed_urls[] = $link;
             update_option("frp_processed_urls_{$config_num}", $processed_urls);
+            update_option("frp_last_run_config_{$config_num}", time());
+            
+            frp_log_message("SUCCESS: Created post #{$post_id}");
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+/**
+ * Process Atom feed format
+ * Atom feeds use <feed> and <entry> elements instead of <rss> and <item>
+ */
+function frp_process_atom_feed($config_num, $xml, $feed_url, $category, $custom_prompt, $is_manual) {
+    // Get feed entries - Atom can have entries directly in feed or in a sub-element
+    $entries = [];
+    
+    // Try to get entries from various Atom structures
+    if (isset($xml->entry)) {
+        $entries = $xml->entry;
+    }
+    
+    if (empty($entries)) {
+        frp_log_message("No entries found in Atom feed");
+        return false;
+    }
+    
+    // Convert to array for consistent handling
+    if (!is_array($entries)) {
+        $entries = [$entries];
+    }
+    
+    frp_log_message("Found " . count($entries) . " entries in Atom feed");
+    
+    // Get settings
+    $processed_urls = get_option("frp_processed_urls_{$config_num}", []);
+    $ignore_processed = get_option('frp_ignore_processed_urls', '1');
+    $max_items = apply_filters('frp_max_feed_items', 10);
+    
+    $item_count = 0;
+    foreach ($entries as $entry) {
+        $item_count++;
+        if ($item_count > $max_items) {
+            frp_log_message("Reached max items limit ({$max_items})");
+            break;
+        }
+        
+        // Get link - Atom uses <link> with href attribute
+        $link = '';
+        if (isset($entry->link['href'])) {
+            $link = (string)$entry->link['href'];
+        } elseif (isset($entry->link)) {
+            // Some Atom feeds have link as element with href
+            foreach ($entry->link as $lnk) {
+                $rel = $lnk['rel'] ?? '';
+                if (empty($rel) || $rel === 'alternate') {
+                    $link = (string)$lnk['href'];
+                    break;
+                }
+            }
+        }
+        
+        // Skip already processed
+        if ($ignore_processed === '1' && in_array($link, $processed_urls)) {
+            continue;
+        }
+        
+        // Get title
+        $title = '';
+        if (isset($entry->title)) {
+            $title = (string)$entry->title;
+        }
+        
+        // Get content - Atom uses <content> or <summary>
+        $content = '';
+        if (isset($entry->content)) {
+            $content = strip_tags(html_entity_decode((string)$entry->content));
+        } elseif (isset($entry->summary)) {
+            $content = strip_tags(html_entity_decode((string)$entry->summary));
+        } elseif (isset($entry->description)) {
+            $content = strip_tags(html_entity_decode((string)$entry->description));
+        }
+        
+        if (empty($content) || strlen($content) < 100) {
+            continue;
+        }
+        
+        // Check keyword filters
+        if (!frp_check_keyword_filters($title, $content)) {
+            continue;
+        }
+        
+        // Check if enhanced research is enabled
+        if (get_option('frp_enable_enhanced_research', '1') === '1') {
+            frp_log_message("  -> Using Enhanced Research Mode for article rewriting");
+            $rewritten = frp_rewrite_with_enhanced_research($title, $content, $custom_prompt, $link);
+        } else {
+            $rewritten = frp_rewrite_with_openai($title, $content, $custom_prompt);
+        }
+        
+        if (!$rewritten) {
+            continue;
+        }
+        
+        // Create post
+        $post_id = wp_insert_post([
+            'post_title' => $rewritten['title'],
+            'post_content' => $rewritten['content'],
+            'post_status' => 'publish',
+            'post_type' => 'post',
+            'post_category' => $category ? [$category] : [],
+            'meta_input' => [
+                '_frp_generated' => 1,
+                '_frp_source_feed' => $feed_url,
+                '_frp_source_link' => $link,
+                '_frp_config_num' => $config_num
+            ],
+        ]);
+        
+        if ($post_id) {
+            // Set featured image - try to extract from content
+            $image_url = '';
+            
+            // Try media:content or enclosure
+            if (isset($entry->link)) {
+                foreach ($entry->link as $lnk) {
+                    if (isset($lnk['rel']) && $lnk['rel'] === 'enclosure') {
+                        $image_url = (string)$lnk['href'];
+                        break;
+                    }
+                }
+            }
+            
+            // If no image from entry, try to get from article URL
+            if (empty($image_url) && !empty($link)) {
+                $image_url = frp_extract_image_from_url($link);
+            }
+            
+            if ($image_url) {
+                frp_set_post_thumbnail($post_id, $image_url);
+            }
+            
+            // Generate tags only if enabled
+            $enable_tags = get_option('frp_enable_tags', '1');
+            if ($enable_tags === '1') {
+                $tags = frp_generate_post_tags($rewritten['content']);
+                if (!empty($tags)) {
+                    wp_set_post_tags($post_id, $tags);
+                }
+            }
+            
+            // Add SEO optimizations
+            frp_add_seo_meta($post_id, $rewritten['title'], $rewritten['content'], $image_url);
+            
+            // Add Schema.org structured data
+            frp_add_schema_markup($post_id, $rewritten['title'], $rewritten['content'], $image_url);
+            
+            // Update processed URLs
+            if (!empty($link)) {
+                $processed_urls[] = $link;
+                update_option("frp_processed_urls_{$config_num}", $processed_urls);
+            }
             update_option("frp_last_run_config_{$config_num}", time());
             
             frp_log_message("SUCCESS: Created post #{$post_id}");
