@@ -217,25 +217,25 @@ function frp_activate_plugin() {
     // Set initial cron status
     update_option('frp_cron_status', 'active');
     
-    // Create log directory if not exists
-    try {
-        frp_create_log_directory();
-    } catch (Exception $e) {
-        wp_die('Feed Rewriter Plugin: Gagal membuat direktori log. Pastikan folder wp-content/uploads bisa ditulis. Error: ' . $e->getMessage());
-    }
+    // Create log directory if not exists (gracefully without dying)
+    frp_create_log_directory();
     
     // Schedule individual crons for each feed with URL
     try {
         frp_schedule_individual_crons();
-    } catch (Exception $e) {
-        frp_log_message("ERROR saat scheduling individual crons: " . $e->getMessage());
+    } catch (\Throwable $e) {
+        if (function_exists('error_log')) {
+            error_log('[Feed Rewriter Plugin] Error scheduling individual crons: ' . $e->getMessage());
+        }
     }
     
     // Also keep main cron as fallback
     try {
         frp_schedule_main_cron();
-    } catch (Exception $e) {
-        frp_log_message("ERROR saat scheduling main cron: " . $e->getMessage());
+    } catch (\Throwable $e) {
+        if (function_exists('error_log')) {
+            error_log('[Feed Rewriter Plugin] Error scheduling main cron: ' . $e->getMessage());
+        }
     }
     
     // Log activation
@@ -612,34 +612,42 @@ function frp_clear_all_cron_schedules() {
 
 /**
  * Create log directory with proper protection
+ * Safely creates folder and protection files without breaking plugin activation
  */
 function frp_create_log_directory() {
-    $log_dir = dirname(FRP_LOG_FILE);
+    $log_file = FRP_LOG_FILE;
+    $log_dir = dirname($log_file);
     
     if (!file_exists($log_dir)) {
-        $created = wp_mkdir_p($log_dir);
-        if (!$created) {
-            wp_die('Feed Rewriter Plugin: Gagal membuat direktori log di ' . esc_html($log_dir) . '. Pastikan folder wp-content/uploads bisa ditulis oleh server.');
+        // Use wp_mkdir_p if available, fallback to mkdir
+        if (function_exists('wp_mkdir_p')) {
+            $created = wp_mkdir_p($log_dir);
+        } else {
+            $created = @mkdir($log_dir, 0755, true);
         }
         
-        // Create .htaccess to prevent direct access
-        $htaccess_path = $log_dir . '/.htaccess';
-        if (!file_exists($htaccess_path)) {
-            $result = file_put_contents($htaccess_path, "# Deny access to this directory\nOrder deny,allow\nDeny from all\n<Files ~ \"^\\.htaccess\">\nAllow from all\n</Files>");
-            if ($result === false) {
-                wp_die('Feed Rewriter Plugin: Gagal membuat file .htaccess di direktori log.');
+        if (!$created && !is_dir($log_dir)) {
+            // Log notice if possible, but do not halt activation
+            if (function_exists('error_log')) {
+                error_log('[Feed Rewriter Plugin] Direktori log tidak dapat dibuat di: ' . $log_dir . '. Pastikan folder uploads dapat ditulis oleh web server.');
             }
-        }
-        
-        // Create empty index.php for extra security
-        $index_path = $log_dir . '/index.php';
-        if (!file_exists($index_path)) {
-            $result = file_put_contents($index_path, "<?php // Silence is golden");
-            if ($result === false) {
-                wp_die('Feed Rewriter Plugin: Gagal membuat file index.php di direktori log.');
-            }
+            return false;
         }
     }
+    
+    // Create .htaccess to prevent direct access
+    $htaccess_path = $log_dir . '/.htaccess';
+    if (!file_exists($htaccess_path) && is_dir($log_dir) && is_writable($log_dir)) {
+        @file_put_contents($htaccess_path, "# Deny direct web access to log files\nOrder deny,allow\nDeny from all\n<Files ~ \"^\\.htaccess\">\nAllow from all\n</Files>");
+    }
+    
+    // Create empty index.php for extra security
+    $index_path = $log_dir . '/index.php';
+    if (!file_exists($index_path) && is_dir($log_dir) && is_writable($log_dir)) {
+        @file_put_contents($index_path, "<?php // Silence is golden\n");
+    }
+
+    return true;
 }
 
 /**
