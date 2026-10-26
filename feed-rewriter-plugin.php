@@ -33,6 +33,154 @@ define('FRP_CRON_HOOK', 'frp_main_cron_event');
 define('FRP_MAX_FEEDS', 5);
 
 // ==============================================================================
+// SECTION 1A: OPTIMIZATION - CACHED OPTIONS AND ARTICLE HTML
+// ==============================================================================
+
+/**
+ * Cached option getter to reduce database queries
+ * Options are cached per-request to avoid repeated get_option() calls
+ */
+function frp_get_cached_option($key, $default = false) {
+    static $cache = [];
+    if (array_key_exists($key, $cache)) {
+        return $cache[$key];
+    }
+    $value = get_option($key, $default);
+    $cache[$key] = $value;
+    return $value;
+}
+
+/**
+ * Get cached article HTML to avoid duplicate HTTP requests
+ * Used when both image extraction and link extraction need the same article page
+ */
+function frp_get_cached_article_html($article_url) {
+    if (empty($article_url)) {
+        return false;
+    }
+    
+    $cache_key = 'frp_article_html_' . md5($article_url);
+    $html = get_transient($cache_key);
+    if ($html !== false) {
+        return $html;
+    }
+    
+    $response = wp_remote_get($article_url, [
+        'timeout' => 10,
+        'user-agent' => 'Mozilla/5.0 (WordPress Feed Rewriter Plugin)',
+    ]);
+    
+    if (is_wp_error($response)) {
+        return false;
+    }
+    
+    $html = wp_remote_retrieve_body($response);
+    if (empty($html)) {
+        return false;
+    }
+    
+    set_transient($cache_key, $html, 12 * HOUR_IN_SECONDS);
+    return $html;
+}
+
+/**
+ * Check if a model supports custom temperature parameter
+ * Some models like gpt-5.6-luna only support the default temperature value
+ */
+function frp_model_supports_temperature($model) {
+    $models_without_custom_temperature = [
+        'gpt-5.6-luna',
+        'gpt-5.4-nano-2026-03-17',
+    ];
+    
+    return !in_array(strtolower($model), $models_without_custom_temperature, true);
+}
+
+/**
+ * Preload all plugin options into cache to reduce database queries
+ * Call this once at the start of cron/manual runs
+ */
+function frp_preload_options() {
+    static $loaded = false;
+    if ($loaded) {
+        return;
+    }
+    
+    $keys = [
+        'frp_api_key', 'frp_model', 'frp_max_tokens', 'frp_temperature',
+        'frp_language', 'frp_keyword_filter', 'frp_exclude_keyword_filter',
+        'frp_ignore_processed_urls', 'frp_ignore_no_image', 'frp_enable_toc',
+        'frp_enable_tags', 'frp_enable_enhanced_research', 'frp_enhanced_max_sources',
+        'frp_cron_status', 'frp_cron_interval', 'frp_post_status',
+        'frp_enable_retry', 'frp_enable_internal_linking', 'frp_internal_links_max',
+    ];
+    
+    foreach ($keys as $key) {
+        frp_get_cached_option($key);
+    }
+    
+    for ($i = 1; $i <= FRP_MAX_FEEDS; $i++) {
+        frp_get_cached_option("frp_feed_url_{$i}");
+        frp_get_cached_option("frp_selected_category_{$i}");
+        frp_get_cached_option("frp_cron_interval_{$i}");
+        frp_get_cached_option("frp_custom_prompt_{$i}");
+        frp_get_cached_option("frp_processed_urls_{$i}");
+        frp_get_cached_option("frp_last_run_config_{$i}");
+    }
+    
+    $loaded = true;
+}
+
+/**
+ * Clean up async posts that never completed processing
+ * Retries post-processing for posts created by the plugin but not fully processed
+ */
+function frp_cleanup_stuck_async_posts() {
+    $stuck_posts = get_posts([
+        'post_type' => 'post',
+        'posts_per_page' => 10,
+        'post_status' => 'publish',
+        'meta_query' => [
+            [
+                'key' => '_frp_generated',
+                'value' => '1',
+            ],
+            [
+                'key' => '_frp_processing_done',
+                'compare' => 'NOT EXISTS',
+            ],
+        ],
+        'date_query' => [
+            [
+                'before' => '1 hour ago',
+            ],
+        ],
+    ]);
+    
+    foreach ($stuck_posts as $post) {
+        $image_url = get_post_meta($post->ID, '_frp_source_link', true);
+        $config_num = get_post_meta($post->ID, '_frp_config_num', true);
+        $schedule_lock_key = FRP_TRANSIENT_PREFIX . 'async_scheduled_' . $post->ID;
+        
+        // Only schedule if not already scheduled
+        if (!get_transient($schedule_lock_key)) {
+            wp_schedule_single_event(time() + 30, 'frp_async_post_process', [
+                $post->ID,
+                $image_url,
+                $post->post_title,
+                $post->post_content,
+                $config_num ?: 1
+            ]);
+            
+            // Set lock for 2 hours to prevent duplicate scheduling
+            set_transient($schedule_lock_key, true, 2 * HOUR_IN_SECONDS);
+            
+            frp_log_message("Menemukan posting yang belum selesai diproses. Post #{$post->ID} dijadwalkan ulang untuk melanjutkan metadata, gambar, dan SEO-nya.");
+        }
+    }
+}
+
+// ==============================================================================
 // SECTION 2: ACTIVATION/DEACTIVATION HANDLERS (CONSOLIDATED)
 // ==============================================================================
 
@@ -50,16 +198,28 @@ function frp_activate_plugin() {
     update_option('frp_cron_status', 'active');
     
     // Create log directory if not exists
-    frp_create_log_directory();
+    try {
+        frp_create_log_directory();
+    } catch (Exception $e) {
+        wp_die('Feed Rewriter Plugin: Gagal membuat direktori log. Pastikan folder wp-content/uploads bisa ditulis. Error: ' . $e->getMessage());
+    }
     
     // Schedule individual crons for each feed with URL
-    frp_schedule_individual_crons();
+    try {
+        frp_schedule_individual_crons();
+    } catch (Exception $e) {
+        frp_log_message("ERROR saat scheduling individual crons: " . $e->getMessage());
+    }
     
     // Also keep main cron as fallback
-    frp_schedule_main_cron();
+    try {
+        frp_schedule_main_cron();
+    } catch (Exception $e) {
+        frp_log_message("ERROR saat scheduling main cron: " . $e->getMessage());
+    }
     
     // Log activation
-    frp_log_message("Plugin activated v" . FRP_VERSION . ". Individual crons scheduled for feeds with URLs.");
+    frp_log_message("Plugin diaktivasi v" . FRP_VERSION . ". Jadwal cron sudah diset. Langkah selanjutnya: buka Settings, isi Feed URL, lalu tekan Save Settings.");
 }
 register_activation_hook(__FILE__, 'frp_activate_plugin');
 
@@ -260,22 +420,22 @@ function frp_process_blogger_text_feed($config_num, $body, $feed_url, $category,
     $items = frp_parse_blogger_text_format($body);
     
     if (empty($items)) {
-        frp_log_message("No items found in Blogger text format feed");
+        frp_log_message("No articles found in this feed. Pastikan URL RSS valid dan mengandung item yang memenuhi syarat minimal 100 karakter.");
         return false;
     }
     
-    frp_log_message("Found " . count($items) . " items in Blogger text format feed");
+    frp_log_message("Found " . count($items) . " articles in feed. Memulai proses filter dan rewrite...");
     
     // Get settings
-    $processed_urls = get_option("frp_processed_urls_{$config_num}", []);
-    $ignore_processed = get_option('frp_ignore_processed_urls', '1');
+    $processed_urls = frp_get_cached_option("frp_processed_urls_{$config_num}", []);
+    $ignore_processed = frp_get_cached_option('frp_ignore_processed_urls', '1');
     $max_items = apply_filters('frp_max_feed_items', 10);
     
     $item_count = 0;
-    foreach ($items as $item) {
+    foreach ($entries as $entry) {
         $item_count++;
         if ($item_count > $max_items) {
-            frp_log_message("Reached max items limit ({$max_items})");
+            frp_log_message("Batas maksimum artikel per proses tercapai ({$max_items}). Naikkan batas hanya jika server memungkinkan.");
             break;
         }
         
@@ -307,8 +467,8 @@ function frp_process_blogger_text_feed($config_num, $body, $feed_url, $category,
         }
         
         // Check if enhanced research is enabled
-        if (get_option('frp_enable_enhanced_research', '1') === '1') {
-            frp_log_message("  -> Using Enhanced Research Mode for article rewriting");
+        if (frp_get_cached_option('frp_enable_enhanced_research', '1') === '1') {
+            frp_log_message("  -> Mode Enhanced Research aktif. Mengumpulkan referensi tambahan dari internet sebelum menulis ulang.");
             $rewritten = frp_rewrite_with_enhanced_research($title, $content, $custom_prompt, $link);
         } else {
             $rewritten = frp_rewrite_with_openai($title, $content, $custom_prompt);
@@ -342,24 +502,14 @@ function frp_process_blogger_text_feed($config_num, $body, $feed_url, $category,
                 $image_url = frp_extract_image_from_url($link);
             }
             
-            if ($image_url) {
-                frp_set_post_thumbnail($post_id, $image_url);
-            }
-            
-            // Generate tags only if enabled
-            $enable_tags = get_option('frp_enable_tags', '1');
-            if ($enable_tags === '1') {
-                $tags = frp_generate_post_tags($rewritten['content']);
-                if (!empty($tags)) {
-                    wp_set_post_tags($post_id, $tags);
-                }
-            }
-            
-            // Add SEO optimizations
-            frp_add_seo_meta($post_id, $rewritten['title'], $rewritten['content'], $image_url);
-            
-            // Add Schema.org structured data
-            frp_add_schema_markup($post_id, $rewritten['title'], $rewritten['content'], $image_url);
+            // Schedule async post-processing (image, tags, SEO)
+            wp_schedule_single_event(time() + 60, 'frp_async_post_process', [
+                $post_id, 
+                $image_url, 
+                $rewritten['title'], 
+                $rewritten['content'],
+                $config_num
+            ]);
             
             // Update processed URLs - use item ID
             if (!empty($item_id)) {
@@ -368,7 +518,7 @@ function frp_process_blogger_text_feed($config_num, $body, $feed_url, $category,
             }
             update_option("frp_last_run_config_{$config_num}", time());
             
-            frp_log_message("SUCCESS: Created post #{$post_id}");
+            frp_log_message("SUCCESS: Created post #{$post_id} (async post-processing scheduled)");
             return true;
         }
     }
@@ -386,7 +536,7 @@ function frp_deactivate_plugin() {
     // Set status to inactive
     update_option('frp_cron_status', 'inactive');
     
-    frp_log_message("Plugin deactivated - all cron jobs cleared.");
+    frp_log_message("Plugin dinonaktifkan. Semua jadwal cron sudah dihapus. Plugin tidak akan generate artikel secara otomatis sampai diaktifkan kembali.");
 }
 register_deactivation_hook(__FILE__, 'frp_deactivate_plugin');
 
@@ -444,18 +594,27 @@ function frp_create_log_directory() {
     $log_dir = dirname(FRP_LOG_FILE);
     
     if (!file_exists($log_dir)) {
-        wp_mkdir_p($log_dir);
+        $created = wp_mkdir_p($log_dir);
+        if (!$created) {
+            wp_die('Feed Rewriter Plugin: Gagal membuat direktori log di ' . esc_html($log_dir) . '. Pastikan folder wp-content/uploads bisa ditulis oleh server.');
+        }
         
         // Create .htaccess to prevent direct access
         $htaccess_path = $log_dir . '/.htaccess';
         if (!file_exists($htaccess_path)) {
-            file_put_contents($htaccess_path, "# Deny access to this directory\nOrder deny,allow\nDeny from all\n<Files ~ \"^\\.htaccess\">\nAllow from all\n</Files>");
+            $result = file_put_contents($htaccess_path, "# Deny access to this directory\nOrder deny,allow\nDeny from all\n<Files ~ \"^\\.htaccess\">\nAllow from all\n</Files>");
+            if ($result === false) {
+                wp_die('Feed Rewriter Plugin: Gagal membuat file .htaccess di direktori log.');
+            }
         }
         
         // Create empty index.php for extra security
         $index_path = $log_dir . '/index.php';
         if (!file_exists($index_path)) {
-            file_put_contents($index_path, "<?php // Silence is golden");
+            $result = file_put_contents($index_path, "<?php // Silence is golden");
+            if ($result === false) {
+                wp_die('Feed Rewriter Plugin: Gagal membuat file index.php di direktori log.');
+            }
         }
     }
 }
@@ -464,6 +623,11 @@ function frp_create_log_directory() {
  * Schedule the main cron event
  */
 function frp_schedule_main_cron() {
+    if (!function_exists('wp_clear_scheduled_hook') || !function_exists('wp_schedule_event')) {
+        frp_log_message("ERROR: Fungsi WordPress cron tidak tersedia. Pastikan WordPress terinstal dengan benar.");
+        return;
+    }
+    
     $interval = get_option('frp_cron_interval', 60);
     $interval = max(1, intval($interval));
     
@@ -553,6 +717,11 @@ add_action(FRP_CRON_HOOK, 'frp_cron_handler');
 function frp_cron_handler($timestamp) {
     frp_log_message("=== CRON TRIGGERED: frp_cron_handler() called ===");
     
+    // Clean up stuck async posts on every cron run
+    frp_cleanup_stuck_async_posts();
+    
+    frp_log_message("Cron otomatis dimulai. Mencari feed yang siap diproses...");
+    
     // Call the main function with is_manual = false
     frp_process_all_feeds(false);
 }
@@ -577,11 +746,14 @@ function frp_feed_cron_handler_5() { frp_process_single_feed_cron(5); }
  * Process single feed from individual cron - independent execution
  */
 function frp_process_single_feed_cron($config_num) {
-    $feed_url = get_option("frp_feed_url_{$config_num}", '');
+    // Preload options to reduce DB queries
+    frp_preload_options();
+    
+    $feed_url = frp_get_cached_option("frp_feed_url_{$config_num}", '');
     
     // Skip if feed URL is empty
     if (empty($feed_url)) {
-        frp_log_message("INDIVIDUAL CRON #{$config_num}: Feed URL empty - skipping and clearing schedule");
+        frp_log_message("Feed #{$config_num}: URL RSS belum diisi. Silakan isi Feed URL di halaman Settings.");
         // Clear this cron since feed has no URL
         wp_clear_scheduled_hook("frp_feed_cron_{$config_num}");
         return;
@@ -590,22 +762,22 @@ function frp_process_single_feed_cron($config_num) {
     frp_log_message("=== INDIVIDUAL CRON #{$config_num} TRIGGERED ===");
     
     // Check cron status
-    $status = get_option('frp_cron_status', 'inactive');
+    $status = frp_get_cached_option('frp_cron_status', 'inactive');
     if ($status !== 'active') {
-        frp_log_message("Cron is paused - skipping feed #{$config_num}");
+        frp_log_message("Cron currently PAUSED. Feed #{$config_num} skipped. Tekan Resume untuk melanjutkan.");
         return;
     }
     
     // CRITICAL FIX: Check interval BEFORE processing
     // This prevents cron from running too frequently even if WordPress triggers it
-    $interval = get_option("frp_cron_interval_{$config_num}", 60);
-    $last_run = get_option("frp_last_run_config_{$config_num}", 0);
+    $interval = frp_get_cached_option("frp_cron_interval_{$config_num}", 60);
+    $last_run = frp_get_cached_option("frp_last_run_config_{$config_num}", 0);
     $time_since_last = time() - $last_run;
     $interval_seconds = $interval * 60;
     
     if ($time_since_last < $interval_seconds) {
         $remaining = $interval_seconds - $time_since_last;
-        frp_log_message("INDIVIDUAL CRON #{$config_num}: Interval not met yet ({$remaining}s remaining) - skipping");
+        frp_log_message("Feed #{$config_num}: Belum waktunya diproses. Sisa {$remaining} detik sebelum cron berikutnya.");
         // DO NOT reschedule - let the existing schedule handle it
         return;
     }
@@ -613,7 +785,7 @@ function frp_process_single_feed_cron($config_num) {
     // Check lock to prevent overlapping
     $lock_key = FRP_TRANSIENT_PREFIX . 'cron_running';
     if (get_transient($lock_key)) {
-        frp_log_message("Cron already running - skipping feed #{$config_num}");
+        frp_log_message("Feed #{$config_num}: Proses lain masih berjalan (lock aktif). Cron ini dilewati untuk menghindari konflik.");
         return;
     }
     
@@ -627,7 +799,7 @@ function frp_process_single_feed_cron($config_num) {
             update_option('frp_last_cron_run', current_time('mysql'));
             // Update the last run time to mark this execution
             update_option("frp_last_run_config_{$config_num}", time());
-            frp_log_message("INDIVIDUAL CRON #{$config_num}: Article processed successfully - next run in {$interval} minutes");
+            frp_log_message("Feed #{$config_num}: Artikel berhasil digenerate! Artikel baru berikutnya akan diproses dalam {$interval} menit.");
             
             // CRITICAL FIX: Manually reschedule ONLY after successful article processing
             // This ensures the cron waits for the correct interval
@@ -640,7 +812,7 @@ function frp_process_single_feed_cron($config_num) {
             // Let the existing WordPress schedule handle it
             // But also update last_run to prevent immediate re-trigger
             update_option("frp_last_run_config_{$config_num}", time());
-            frp_log_message("INDIVIDUAL CRON #{$config_num}: No article processed - waiting for next scheduled run");
+            frp_log_message("Feed #{$config_num}: Tidak ada artikel baru yang memenuhi syarat saat ini. Cek feed URL dan filter keyword di Settings.");
         }
         
     } catch (Exception $e) {
@@ -656,10 +828,47 @@ function frp_process_single_feed_cron($config_num) {
  * Uses individual schedule per feed based on their configured interval
  */
 function frp_schedule_individual_crons() {
-    // Ensure cron schedules are registered with correct intervals
-    // This will register individual feed intervals dynamically
-    apply_filters('cron_schedules', []);
+    if (!function_exists('wp_get_schedules')) {
+        frp_log_message("ERROR: wp_get_schedules tidak tersedia. Pastikan WordPress terinstal dengan benar.");
+        return;
+    }
     
+    if (!function_exists('wp_schedule_event')) {
+        frp_log_message("ERROR: wp_schedule_event tidak tersedia. Pastikan WordPress terinstal dengan benar.");
+        return;
+    }
+    
+    if (!function_exists('wp_clear_scheduled_hook')) {
+        frp_log_message("ERROR: wp_clear_scheduled_hook tidak tersedia. Pastikan WordPress terinstal dengan benar.");
+        return;
+    }
+    
+    // Register all individual feed schedules FIRST before calling wp_get_schedules()
+    // This ensures schedules are available when wp_schedule_event() is called
+    for ($i = 1; $i <= FRP_MAX_FEEDS; $i++) {
+        $feed_url = get_option("frp_feed_url_{$i}", '');
+        
+        // Only register schedule if feed URL is not empty
+        if (!empty($feed_url)) {
+            $interval = get_option("frp_cron_interval_{$i}", 60);
+            $interval = max(1, intval($interval));
+            $schedule_name = 'frp_feed_interval_' . $i;
+            
+            // Register this feed's interval dynamically
+            add_filter('cron_schedules', function($schedules) use ($i, $interval) {
+                $schedules['frp_feed_interval_' . $i] = [
+                    'interval' => $interval * 60,
+                    'display'  => sprintf(__('Feed #%d every %d minutes', 'feed-rewriter-plugin'), $i, $interval)
+                ];
+                return $schedules;
+            });
+        }
+    }
+    
+    // Now call wp_get_schedules() to ensure all schedules are registered and cache is populated
+    wp_get_schedules();
+    
+    // Now schedule individual crons
     for ($i = 1; $i <= FRP_MAX_FEEDS; $i++) {
         $feed_url = get_option("frp_feed_url_{$i}", '');
         
@@ -674,28 +883,15 @@ function frp_schedule_individual_crons() {
             // Use individual feed-specific schedule
             $schedule_name = 'frp_feed_interval_' . $i;
             
-            // First ensure the schedule is registered
-            $schedules = wp_get_schedules();
-            if (!isset($schedules[$schedule_name])) {
-                // Register this feed's interval dynamically
-                add_filter('cron_schedules', function($schedules) use ($i, $interval) {
-                    $schedules['frp_feed_interval_' . $i] = [
-                        'interval' => $interval * 60,
-                        'display'  => sprintf(__('Feed #%d every %d minutes', 'feed-rewriter-plugin'), $i, $interval)
-                    ];
-                    return $schedules;
-                });
-            }
-            
             // Schedule new event with individual interval
             $next_run = time() + ($interval * 60);
             wp_schedule_event($next_run, $schedule_name, "frp_feed_cron_{$i}");
             
-            frp_log_message("Scheduled individual cron for Feed #{$i}: every {$interval} minutes");
+            frp_log_message("Feed #{$i}: Cron dijadwalkan setiap {$interval} menit. Pastikan URL valid dan interval sesuai kebutuhan.");
         } else {
             // Clear cron if feed URL is empty
             wp_clear_scheduled_hook("frp_feed_cron_{$i}");
-            frp_log_message("Feed #{$i} has no URL - cron excluded");
+            frp_log_message("Feed #{$i}: Tidak ada URL, cron dilewati. Isi Feed URL di Settings untuk mengaktifkan.");
         }
     }
 }
@@ -711,7 +907,7 @@ function frp_process_all_feeds($is_manual = false) {
     // For manual runs, skip the lock check entirely to allow immediate execution
     // For cron, use the lock to prevent overlapping runs
     if (!$is_manual && get_transient($lock_key)) {
-        frp_log_message("Cron already running - skipping this execution");
+        frp_log_message("Proses lain masih berjalan. Cron otomatis dilewati untuk menghindari konflik. Cek log untuk detail.");
         return;
     }
     
@@ -720,18 +916,21 @@ function frp_process_all_feeds($is_manual = false) {
         set_transient($lock_key, true, 25 * MINUTE_IN_SECONDS);
     }
     
+    // Preload all options to reduce DB queries
+    frp_preload_options();
+    
     // Check cron status (skip for manual runs)
-    $status = get_option('frp_cron_status', 'inactive');
+    $status = frp_get_cached_option('frp_cron_status', 'inactive');
     if (!$is_manual && $status !== 'active') {
-        frp_log_message("Cron is paused - skipping execution");
+        frp_log_message("Plugin sedang PAUSED. Cron otomatis tidak berjalan. Tekan Resume di Control Panel untuk mengaktifkan kembali.");
         if (!$is_manual) delete_transient($lock_key);
         return;
     }
     
     // Validate API key
-    $api_key = get_option('frp_api_key');
+    $api_key = frp_get_cached_option('frp_api_key');
     if (empty($api_key)) {
-        frp_log_message("ERROR: OpenAI API key not configured");
+        frp_log_message("ERROR: OpenAI API key belum diisi. Buka Settings dan masukkan API Key terlebih dahulu.");
         if (!$is_manual) delete_transient($lock_key);
         return;
     }
@@ -754,9 +953,10 @@ function frp_process_all_feeds($is_manual = false) {
         // Update last run time
         if ($processed > 0) {
             update_option('frp_last_cron_run', current_time('mysql'));
-            frp_log_message($is_manual ? "Manual run completed - {$processed} article(s) processed" : "Cron completed - {$processed} article(s) processed");
+            frp_log_message($is_manual ? "Manual run selesai: {$processed} artikel berhasil diproses. Cek daftar artikel di bawah." : "Cron selesai: {$processed} artikel baru berhasil digenerate. Artikel akan muncul di WordPress shortly.");
         } else {
-            frp_log_message($is_manual ? "Manual run completed - no articles processed (check feed URLs and settings)" : "Cron completed - no articles processed");
+            $reason = $is_manual ? "Tidak ada artikel baru yang cocok. Cek Feed URL, keyword filter, atau interval cron." : "Tidak ada artikel baru saat ini. Feed mungkin belum update atau semua artikel sudah diproses sebelumnya.";
+            frp_log_message($is_manual ? "Manual run selesai - no articles processed (check feed URLs and settings)" : "Cron selesai - {$reason}");
         }
         
     } catch (Exception $e) {
@@ -775,7 +975,7 @@ function frp_process_all_feeds($is_manual = false) {
  * @param bool $is_manual - true if called from manual run button
  */
 function frp_process_single_feed_v2($config_num, $is_manual = false) {
-    $feed_url = get_option("frp_feed_url_{$config_num}", '');
+    $feed_url = frp_get_cached_option("frp_feed_url_{$config_num}", '');
     
     if (empty($feed_url)) {
         return false;
@@ -785,8 +985,8 @@ function frp_process_single_feed_v2($config_num, $is_manual = false) {
     // Note: This check is also done in frp_process_single_feed_cron() for individual crons
     // but kept here for the main cron handler and as a safety measure
     if (!$is_manual) {
-        $interval = get_option("frp_cron_interval_{$config_num}", 60);
-        $last_run = get_option("frp_last_run_config_{$config_num}", 0);
+        $interval = frp_get_cached_option("frp_cron_interval_{$config_num}", 60);
+        $last_run = frp_get_cached_option("frp_last_run_config_{$config_num}", 0);
         
         if (time() - $last_run < ($interval * 60)) {
             return false;
@@ -797,11 +997,11 @@ function frp_process_single_feed_v2($config_num, $is_manual = false) {
     }
     
     // Get settings
-    $category = get_option("frp_selected_category_{$config_num}", '');
-    $custom_prompt = get_option("frp_custom_prompt_{$config_num}", 'Rewrite the following content:');
+    $category = frp_get_cached_option("frp_selected_category_{$config_num}", '');
+    $custom_prompt = frp_get_cached_option("frp_custom_prompt_{$config_num}", 'Rewrite the following content:');
     
     $source_type = $is_manual ? 'MANUAL' : 'CRON';
-    frp_log_message("Processing Feed #{$config_num} [{$source_type}]: " . substr($feed_url, 0, 40) . "...");
+    frp_log_message("Processing Feed #{$config_num} [{$source_type}]: Feed URL: " . substr($feed_url, 0, 60) . "...");
     
     // Fetch feed
     $response = wp_remote_get($feed_url, [
@@ -811,25 +1011,25 @@ function frp_process_single_feed_v2($config_num, $is_manual = false) {
     ]);
     
     if (is_wp_error($response)) {
-        frp_log_message("Feed fetch error: " . $response->get_error_message());
+        frp_log_message("Gagal mengambil feed. Error: " . $response->get_error_message() . ". Cek URL feed atau koneksi server.");
         return false;
     }
     
     // Check HTTP response code
     $response_code = wp_remote_retrieve_response_code($response);
     if ($response_code !== 200) {
-        frp_log_message("Feed HTTP error: Response code " . $response_code);
+        frp_log_message("Feed error: Server mengembalikan kode HTTP {$response_code}. Cek URL feed atau hubungi admin server.");
         return false;
     }
     
     $body = wp_remote_retrieve_body($response);
     
     // Debug: Log first 500 chars of response
-    frp_log_message("DEBUG: Feed response starts with: " . substr($body, 0, 500));
+    frp_log_message("DEBUG: Respons feed diterima. Format: " . substr($body, 0, 120) . "...");
     
     // Check if feed is in Blogger text format (non-XML)
     if (frp_is_blogger_text_format($body)) {
-        frp_log_message("Detected Blogger text format feed - using text parser");
+        frp_log_message("Terdeteksi format Blogger text feed. Menggunakan parser khusus untuk format ini.");
         return frp_process_blogger_text_feed($config_num, $body, $feed_url, $category, $custom_prompt, $is_manual);
     }
     
@@ -839,8 +1039,8 @@ function frp_process_single_feed_v2($config_num, $is_manual = false) {
     if (!$xml) {
         $xml_error = libxml_get_last_error();
         $xml_error_msg = $xml_error ? $xml_error->message : 'No XML error details';
-        frp_log_message("Invalid feed XML - libxml error: " . $xml_error_msg);
-        frp_log_message("Invalid feed XML - body length: " . strlen($body) . ", first 300 chars: " . substr($body, 0, 300));
+        frp_log_message("Format feed tidak valid. Detail error: " . $xml_error_msg);
+        frp_log_message("Saran: Pastikan URL mengarah ke RSS/Atom yang valid. Panjang respons: " . strlen($body) . " karakter.");
         return false;
     }
     
@@ -856,11 +1056,11 @@ function frp_process_single_feed_v2($config_num, $is_manual = false) {
         // Atom format with feed element
         $is_atom = true;
     } else {
-        frp_log_message("Invalid feed XML - no channel or entry element found. Root element: " . ($xml->getName() ?? 'unknown'));
+        frp_log_message("Format feed tidak dikenali. Root element: " . ($xml->getName() ?? 'unknown') . ". Pastikan ini RSS atau Atom feed.");
         return false;
     }
     
-    frp_log_message("Detected " . ($is_atom ? "Atom" : "RSS") . " feed format");
+    frp_log_message("Format terdeteksi: " . ($is_atom ? "Atom" : "RSS") . ". Melanjutkan ekstraksi artikel...");
     
     // Process based on format
     if ($is_atom) {
@@ -868,15 +1068,15 @@ function frp_process_single_feed_v2($config_num, $is_manual = false) {
     }
     
     // Process items - limit to first 10 items for performance
-    $processed_urls = get_option("frp_processed_urls_{$config_num}", []);
-    $ignore_processed = get_option('frp_ignore_processed_urls', '1');
+    $processed_urls = frp_get_cached_option("frp_processed_urls_{$config_num}", []);
+    $ignore_processed = frp_get_cached_option('frp_ignore_processed_urls', '1');
     $max_items = apply_filters('frp_max_feed_items', 10); // Allow filtering
     
     $item_count = 0;
     foreach ($xml->channel->item as $item) {
         $item_count++;
         if ($item_count > $max_items) {
-            frp_log_message("Reached max items limit ({$max_items})");
+            frp_log_message("Batas maksimum artikel per proses tercapai ({$max_items}). Naikkan batas hanya jika server memungkinkan.");
             break;
         }
         
@@ -901,8 +1101,8 @@ function frp_process_single_feed_v2($config_num, $is_manual = false) {
         }
         
         // Check if enhanced research is enabled - use enhanced rewrite
-        if (get_option('frp_enable_enhanced_research', '1') === '1') {
-            frp_log_message("  -> Using Enhanced Research Mode for article rewriting");
+        if (frp_get_cached_option('frp_enable_enhanced_research', '1') === '1') {
+            frp_log_message("  -> Mode Enhanced Research aktif. Mengumpulkan referensi tambahan dari internet sebelum menulis ulang.");
             $rewritten = frp_rewrite_with_enhanced_research($title, $content, $custom_prompt, $link);
         } else {
             // Regular rewrite
@@ -910,6 +1110,7 @@ function frp_process_single_feed_v2($config_num, $is_manual = false) {
         }
         
         if (!$rewritten) {
+            frp_log_message("Gagal menulis ulang artikel dari feed ini. OpenAI API mungkin sibuk atau respons tidak valid. Coba lagi nanti.");
             continue;
         }
         
@@ -937,31 +1138,21 @@ function frp_process_single_feed_v2($config_num, $is_manual = false) {
                 $image_url = frp_extract_image_from_url($link);
             }
             
-            if ($image_url) {
-                frp_set_post_thumbnail($post_id, $image_url);
-            }
-            
-            // Generate tags only if enabled (saves API calls)
-            $enable_tags = get_option('frp_enable_tags', '1');
-            if ($enable_tags === '1') {
-                $tags = frp_generate_post_tags($rewritten['content']);
-                if (!empty($tags)) {
-                    wp_set_post_tags($post_id, $tags);
-                }
-            }
-            
-            // Add SEO optimizations
-            frp_add_seo_meta($post_id, $rewritten['title'], $rewritten['content'], $image_url);
-            
-            // Add Schema.org structured data
-            frp_add_schema_markup($post_id, $rewritten['title'], $rewritten['content'], $image_url);
+            // Schedule async post-processing (image, tags, SEO)
+            wp_schedule_single_event(time() + 60, 'frp_async_post_process', [
+                $post_id, 
+                $image_url, 
+                $rewritten['title'], 
+                $rewritten['content'],
+                $config_num
+            ]);
             
             // Update processed URLs
             $processed_urls[] = $link;
             update_option("frp_processed_urls_{$config_num}", $processed_urls);
             update_option("frp_last_run_config_{$config_num}", time());
             
-            frp_log_message("SUCCESS: Created post #{$post_id}");
+            frp_log_message("SUCCESS: Created post #{$post_id} (async post-processing scheduled)");
             return true;
         }
     }
@@ -983,7 +1174,7 @@ function frp_process_atom_feed($config_num, $xml, $feed_url, $category, $custom_
     }
     
     if (empty($entries)) {
-        frp_log_message("No entries found in Atom feed");
+        frp_log_message("Tidak ada entri ditemukan di feed Atom. Pastikan feed valid dan berisi konten artikel.");
         return false;
     }
     
@@ -992,18 +1183,18 @@ function frp_process_atom_feed($config_num, $xml, $feed_url, $category, $custom_
         $entries = [$entries];
     }
     
-    frp_log_message("Found " . count($entries) . " entries in Atom feed");
+    frp_log_message("Ditemukan " . count($entries) . " entri di feed Atom. Memulai proses filter dan rewrite...");
     
     // Get settings
-    $processed_urls = get_option("frp_processed_urls_{$config_num}", []);
-    $ignore_processed = get_option('frp_ignore_processed_urls', '1');
+    $processed_urls = frp_get_cached_option("frp_processed_urls_{$config_num}", []);
+    $ignore_processed = frp_get_cached_option('frp_ignore_processed_urls', '1');
     $max_items = apply_filters('frp_max_feed_items', 10);
     
     $item_count = 0;
     foreach ($entries as $entry) {
         $item_count++;
         if ($item_count > $max_items) {
-            frp_log_message("Reached max items limit ({$max_items})");
+            frp_log_message("Batas maksimum artikel per proses tercapai ({$max_items}). Naikkan batas hanya jika server memungkinkan.");
             break;
         }
         
@@ -1053,8 +1244,8 @@ function frp_process_atom_feed($config_num, $xml, $feed_url, $category, $custom_
         }
         
         // Check if enhanced research is enabled
-        if (get_option('frp_enable_enhanced_research', '1') === '1') {
-            frp_log_message("  -> Using Enhanced Research Mode for article rewriting");
+        if (frp_get_cached_option('frp_enable_enhanced_research', '1') === '1') {
+            frp_log_message("  -> Mode Enhanced Research aktif. Mengumpulkan referensi tambahan dari internet sebelum menulis ulang.");
             $rewritten = frp_rewrite_with_enhanced_research($title, $content, $custom_prompt, $link);
         } else {
             $rewritten = frp_rewrite_with_openai($title, $content, $custom_prompt);
@@ -1098,24 +1289,14 @@ function frp_process_atom_feed($config_num, $xml, $feed_url, $category, $custom_
                 $image_url = frp_extract_image_from_url($link);
             }
             
-            if ($image_url) {
-                frp_set_post_thumbnail($post_id, $image_url);
-            }
-            
-            // Generate tags only if enabled
-            $enable_tags = get_option('frp_enable_tags', '1');
-            if ($enable_tags === '1') {
-                $tags = frp_generate_post_tags($rewritten['content']);
-                if (!empty($tags)) {
-                    wp_set_post_tags($post_id, $tags);
-                }
-            }
-            
-            // Add SEO optimizations
-            frp_add_seo_meta($post_id, $rewritten['title'], $rewritten['content'], $image_url);
-            
-            // Add Schema.org structured data
-            frp_add_schema_markup($post_id, $rewritten['title'], $rewritten['content'], $image_url);
+            // Schedule async post-processing (image, tags, SEO)
+            wp_schedule_single_event(time() + 60, 'frp_async_post_process', [
+                $post_id, 
+                $image_url, 
+                $rewritten['title'], 
+                $rewritten['content'],
+                $config_num
+            ]);
             
             // Update processed URLs
             if (!empty($link)) {
@@ -1124,7 +1305,7 @@ function frp_process_atom_feed($config_num, $xml, $feed_url, $category, $custom_
             }
             update_option("frp_last_run_config_{$config_num}", time());
             
-            frp_log_message("SUCCESS: Created post #{$post_id}");
+            frp_log_message("SUCCESS: Created post #{$post_id} (async post-processing scheduled)");
             return true;
         }
     }
@@ -1187,20 +1368,33 @@ function frp_extract_image_from_url($article_url) {
     
     frp_log_message("  -> Fetching image from article URL: " . substr($article_url, 0, 40) . "...");
     
-    // Fetch the article page
-    $response = wp_remote_get($article_url, [
-        'timeout' => 15,
-        'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    ]);
+    // Try to get cached HTML first
+    $html = frp_get_cached_article_html($article_url);
     
-    if (is_wp_error($response)) {
-        frp_log_message("  -> Failed to fetch article: " . $response->get_error_message());
-        return '';
+    // If not cached, fetch it
+    if ($html === false) {
+        $response = wp_remote_get($article_url, [
+            'timeout' => 10,
+            'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        ]);
+        
+        if (is_wp_error($response)) {
+            frp_log_message("  -> Failed to fetch article: " . $response->get_error_message());
+            return '';
+        }
+        
+        $html = wp_remote_retrieve_body($response);
+        if (empty($html)) {
+            return '';
+        }
     }
     
-    $html = wp_remote_retrieve_body($response);
-    if (empty($html)) {
-        return '';
+    // Fast regex pre-check for common meta tags (avoids heavy DOMDocument parsing)
+    if (preg_match('/<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']/', $html, $matches)) {
+        return esc_url_raw($matches[1]);
+    }
+    if (preg_match('/<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']/', $html, $matches)) {
+        return esc_url_raw($matches[1]);
     }
     
     $doc = new DOMDocument();
@@ -1303,20 +1497,25 @@ function frp_extract_links_from_article($article_url, $max_links = 3) {
     
     frp_log_message("  -> Extracting related links from article...");
     
-    // Fetch the article page - reduced timeout for performance
-    $response = wp_remote_get($article_url, [
-        'timeout' => 10, // Reduced from 15 for faster failure
-        'user-agent' => 'Mozilla/5.0 (WordPress Feed Reader)',
-    ]);
+    // Try to get cached HTML first
+    $html = frp_get_cached_article_html($article_url);
     
-    if (is_wp_error($response)) {
-        frp_log_message("  -> Failed to fetch article for links: " . $response->get_error_message());
-        return [];
-    }
-    
-    $html = wp_remote_retrieve_body($response);
-    if (empty($html)) {
-        return [];
+    // If not cached, fetch it
+    if ($html === false) {
+        $response = wp_remote_get($article_url, [
+            'timeout' => 10,
+            'user-agent' => 'Mozilla/5.0 (WordPress Feed Reader)',
+        ]);
+        
+        if (is_wp_error($response)) {
+            frp_log_message("  -> Failed to fetch article for links: " . $response->get_error_message());
+            return [];
+        }
+        
+        $html = wp_remote_retrieve_body($response);
+        if (empty($html)) {
+            return [];
+        }
     }
     
     $doc = new DOMDocument();
@@ -1456,15 +1655,15 @@ function frp_collect_additional_content($urls) {
  * Rewrite content with enhanced research (collects additional data first)
  */
 function frp_rewrite_with_enhanced_research($title, $content, $custom_prompt, $article_url) {
-    $api_key = get_option('frp_api_key');
-    $model = get_option('frp_model', 'gpt-4o-mini');
-    $language = get_option('frp_language', 'en');
-    $max_tokens = get_option('frp_max_tokens', 1500);
-    $temperature = get_option('frp_temperature', 0.5);
-    $max_sources = get_option('frp_enhanced_max_sources', 3);
+    $api_key = frp_get_cached_option('frp_api_key');
+    $model = frp_get_cached_option('frp_model', 'gpt-4o-mini');
+    $language = frp_get_cached_option('frp_language', 'en');
+    $max_tokens = frp_get_cached_option('frp_max_tokens', 1500);
+    $temperature = frp_get_cached_option('frp_temperature', 0.5);
+    $max_sources = frp_get_cached_option('frp_enhanced_max_sources', 3);
     
     // Check if enhanced research is enabled
-    if (get_option('frp_enable_enhanced_research', '1') !== '1') {
+    if (frp_get_cached_option('frp_enable_enhanced_research', '1') !== '1') {
         return frp_rewrite_with_openai($title, $content, $custom_prompt);
     }
     
@@ -1491,10 +1690,24 @@ function frp_rewrite_with_enhanced_research($title, $content, $custom_prompt, $a
     
     // Build the enhanced prompt
     $prompt = $custom_prompt . "\n\n" .
-        "Create a comprehensive, well-structured article based on the following content AND the additional research data provided. " .
-        "The article should be informative, engaging, and suitable for publishing. " .
-        "Use the additional research data to enrich the content with more information and insights. " .
-        "Ensure the title is concise (max 65 characters) and engaging. " .
+        "Tulis ulang artikel berikut secara menyeluruh, menggabungkan konten sumber dan data penelitian tambahan.\n\n" .
+        "Pertahankan:\n" .
+        "- fakta utama\n" .
+        "- informasi penting\n" .
+        "- maksud setiap bagian\n\n" .
+        "Ubah:\n" .
+        "- struktur kalimat\n" .
+        "- urutan penyampaian\n" .
+        "- pilihan kata\n" .
+        "- gaya penulisan\n" .
+        "- heading jika diperlukan\n" .
+        "- contoh dan penjelasan agar lebih natural\n\n" .
+        "Jangan:\n" .
+        "- menghilangkan informasi penting\n" .
+        "- menambahkan fakta yang tidak ada di sumber\n" .
+        "- sekadar mengganti sinonim\n" .
+        "- mempertahankan struktur kalimat asli\n\n" .
+        "Gunakan data penelitian tambahan untuk memperkaya artikel dengan informasi dan wawasan lebih banyak.\n\n" .
         "IMPORTANT FORMATTING RULES:\n" .
         "- Use <h2> for main section headings (do NOT add 'H2:' prefix, just the heading text)\n" .
         "- Use <h3> for subsections (do NOT add 'H3:' prefix, just the heading text)\n" .
@@ -1508,17 +1721,28 @@ function frp_rewrite_with_enhanced_research($title, $content, $custom_prompt, $a
         $research_data;
     
     // Send to OpenAI
+    $request_body = [
+        'model' => $model,
+        'messages' => [['role' => 'user', 'content' => $prompt]],
+    ];
+    
+    // Only include temperature if the model supports custom temperature values
+    if (frp_model_supports_temperature($model)) {
+        $request_body['temperature'] = (float) $temperature;
+    }
+    
+    // Only include max_tokens if it's set and > 0
+    // Some models like gpt-5.6-luna don't accept null for max_tokens
+    if ($max_tokens > 0) {
+        $request_body['max_tokens'] = (int) $max_tokens;
+    }
+    
     $response = wp_remote_post('https://api.openai.com/v1/chat/completions', [
         'headers' => [
             'Content-Type' => 'application/json',
             'Authorization' => 'Bearer ' . $api_key
         ],
-        'body' => json_encode([
-            'model' => $model,
-            'messages' => [['role' => 'user', 'content' => $prompt]],
-            'temperature' => (float) $temperature,
-            'max_tokens' => $max_tokens > 0 ? (int) $max_tokens : null
-        ]),
+        'body' => json_encode($request_body),
         'timeout' => 90 // Longer timeout for enhanced research
     ]);
     
@@ -1528,14 +1752,27 @@ function frp_rewrite_with_enhanced_research($title, $content, $custom_prompt, $a
         return frp_rewrite_with_openai($title, $content, $custom_prompt);
     }
     
-    $body = json_decode(wp_remote_retrieve_body($response), true);
-    
-    if (!isset($body['choices'][0]['message']['content'])) {
-        frp_log_message("OpenAI API invalid response - falling back to regular rewrite");
+    $response_code = wp_remote_retrieve_response_code($response);
+    if ($response_code !== 200) {
+        $response_body = wp_remote_retrieve_body($response);
+        frp_log_message("OpenAI API HTTP error: Code {$response_code}. Body: " . substr($response_body, 0, 300));
         return frp_rewrite_with_openai($title, $content, $custom_prompt);
     }
     
-    $text = $body['choices'][0]['message']['content'];
+    $body = json_decode(wp_remote_retrieve_body($response), true);
+    
+    if (isset($body['error'])) {
+        frp_log_message("OpenAI API error response: " . $body['error']['message'] . " (type: " . $body['error']['type'] . ")");
+        return frp_rewrite_with_openai($title, $content, $custom_prompt);
+    }
+    
+    $api_content = $body['choices'][0]['message']['content'] ?? null;
+    if (!$api_content) {
+        frp_log_message("OpenAI API invalid response - choices/content missing. Response keys: " . implode(', ', array_keys($body)));
+        return frp_rewrite_with_openai($title, $content, $custom_prompt);
+    }
+    
+    $text = $api_content;
     $parts = explode("\n\n", $text, 2);
     
     $clean_title = trim($parts[0]);
@@ -1557,7 +1794,7 @@ function frp_rewrite_with_enhanced_research($title, $content, $custom_prompt, $a
  */
 function frp_check_keyword_filters($title, $content) {
     // Check included keywords
-    $keywords = get_option('frp_keyword_filter', '');
+    $keywords = frp_get_cached_option('frp_keyword_filter', '');
     if (!empty($keywords)) {
         $keyword_list = array_filter(array_map('trim', explode("\n", $keywords)));
         $found = false;
@@ -1575,7 +1812,7 @@ function frp_check_keyword_filters($title, $content) {
     }
     
     // Check excluded keywords
-    $exclude = get_option('frp_exclude_keyword_filter', '');
+    $exclude = frp_get_cached_option('frp_exclude_keyword_filter', '');
     if (!empty($exclude)) {
         $exclude_list = array_map('trim', explode(',', strtolower($exclude)));
         
@@ -1593,15 +1830,30 @@ function frp_check_keyword_filters($title, $content) {
  * Rewrite content with OpenAI
  */
 function frp_rewrite_with_openai($title, $content, $custom_prompt) {
-    $api_key = get_option('frp_api_key');
-    $model = get_option('frp_model', 'gpt-4o-mini');
-    $language = get_option('frp_language', 'en');
-    $max_tokens = get_option('frp_max_tokens', 1500);
-    $temperature = get_option('frp_temperature', 0.5);
+    $api_key = frp_get_cached_option('frp_api_key');
+    $model = frp_get_cached_option('frp_model', 'gpt-4o-mini');
+    $language = frp_get_cached_option('frp_language', 'en');
+    $max_tokens = frp_get_cached_option('frp_max_tokens', 1500);
+    $temperature = frp_get_cached_option('frp_temperature', 0.5);
     
     $prompt = "{$custom_prompt}\n\n" .
-        "Rewrite the following title and content to make it suitable for publishing. " .
-        "Ensure the title is concise (max 65 characters) and engaging. " .
+        "Tulis ulang artikel berikut secara menyeluruh.\n\n" .
+        "Pertahankan:\n" .
+        "- fakta utama\n" .
+        "- informasi penting\n" .
+        "- maksud setiap bagian\n\n" .
+        "Ubah:\n" .
+        "- struktur kalimat\n" .
+        "- urutan penyampaian\n" .
+        "- pilihan kata\n" .
+        "- gaya penulisan\n" .
+        "- heading jika diperlukan\n" .
+        "- contoh dan penjelasan agar lebih natural\n\n" .
+        "Jangan:\n" .
+        "- menghilangkan informasi penting\n" .
+        "- menambahkan fakta yang tidak ada di sumber\n" .
+        "- sekadar mengganti sinonim\n" .
+        "- mempertahankan struktur kalimat asli\n\n" .
         "IMPORTANT FORMATTING RULES:\n" .
         "- Use <h2> for main section headings (do NOT add 'H2:' prefix, just the heading text)\n" .
         "- Use <h3> for subsections (do NOT add 'H3:' prefix, just the heading text)\n" .
@@ -1613,17 +1865,28 @@ function frp_rewrite_with_openai($title, $content, $custom_prompt) {
         "Title: {$title}\n\n" .
         "Content:\n{$content}";
     
+    $request_body = [
+        'model' => $model,
+        'messages' => [['role' => 'user', 'content' => $prompt]],
+    ];
+    
+    // Only include temperature if the model supports custom temperature values
+    if (frp_model_supports_temperature($model)) {
+        $request_body['temperature'] = (float) $temperature;
+    }
+    
+    // Only include max_tokens if it's set and > 0
+    // Some models like gpt-5.6-luna don't accept null for max_tokens
+    if ($max_tokens > 0) {
+        $request_body['max_tokens'] = (int) $max_tokens;
+    }
+    
     $response = wp_remote_post('https://api.openai.com/v1/chat/completions', [
         'headers' => [
             'Content-Type' => 'application/json',
             'Authorization' => 'Bearer ' . $api_key
         ],
-        'body' => json_encode([
-            'model' => $model,
-            'messages' => [['role' => 'user', 'content' => $prompt]],
-            'temperature' => (float) $temperature,
-            'max_tokens' => $max_tokens > 0 ? (int) $max_tokens : null
-        ]),
+        'body' => json_encode($request_body),
         'timeout' => 60
     ]);
     
@@ -1632,20 +1895,35 @@ function frp_rewrite_with_openai($title, $content, $custom_prompt) {
         return null;
     }
     
-    $body = json_decode(wp_remote_retrieve_body($response), true);
-    
-    if (!isset($body['choices'][0]['message']['content'])) {
-        frp_log_message("OpenAI API invalid response");
+    $response_code = wp_remote_retrieve_response_code($response);
+    if ($response_code !== 200) {
+        $response_body = wp_remote_retrieve_body($response);
+        frp_log_message("OpenAI API HTTP error: Code {$response_code}. Body: " . substr($response_body, 0, 300));
         return null;
     }
     
-    $text = $body['choices'][0]['message']['content'];
+    $body = json_decode(wp_remote_retrieve_body($response), true);
+    
+    if (isset($body['error'])) {
+        frp_log_message("OpenAI API error response: " . $body['error']['message'] . " (type: " . $body['error']['type'] . ")");
+        return null;
+    }
+    
+    $api_content = $body['choices'][0]['message']['content'] ?? null;
+    if (!$api_content) {
+        frp_log_message("OpenAI API invalid response - choices/content missing. Response keys: " . implode(', ', array_keys($body)));
+        return null;
+    }
+    
+    $text = $api_content;
     $parts = explode("\n\n", $text, 2);
     
     $clean_title = trim($parts[0]);
     $clean_title = preg_replace('/^#+\s*/', '', $clean_title); // Remove markdown headings like ## 
     $clean_title = preg_replace('/^(Title:|Judul:)\s*/i', '', $clean_title);
+    $clean_title = preg_replace('/^Meta Description:.*$/im', '', $clean_title); // Remove Meta Description from title
     $clean_title = trim($clean_title, '"\'');
+    $clean_title = trim($clean_title);
     
     $clean_content = isset($parts[1]) ? trim($parts[1]) : '';
     $clean_content = frp_clean_output_content($clean_content);
@@ -1660,10 +1938,11 @@ function frp_rewrite_with_openai($title, $content, $custom_prompt) {
  * Clean output content
  */
 function frp_clean_output_content($content) {
-    // Remove Meta Description lines (various formats)
-    $content = preg_replace('/^<strong>Meta Description:<\/strong>.*$/im', '', $content);
-    $content = preg_replace('/^Meta Description:.*$/im', '', $content);
-    $content = preg_replace('/^\*\*Meta Description:\*\*.*$/im', '', $content);
+    // Remove Meta Description lines (various formats) - must be at start of line
+    $content = preg_replace('/^<strong>\s*Meta Description:\s*<\/strong>.*$/im', '', $content);
+    $content = preg_replace('/^\s*Meta Description:\s*.*$/im', '', $content);
+    $content = preg_replace('/^\s*\*\*\s*Meta Description:\s*\*\*.*$/im', '', $content);
+    $content = preg_replace('/^\s*-\s*Meta Description:\s*.*$/im', '', $content);
     
     // Remove FAQ headers that might be included by mistake
     $content = preg_replace('/^<h2>\s*FAQ\s*<\/h2>$/im', '<h2>FAQ</h2>', $content);
@@ -1697,7 +1976,7 @@ function frp_clean_output_content($content) {
     $content = trim($content);
     
     // Add TOC if enabled - Google SEO Optimized Version
-    if (get_option('frp_enable_toc', 'yes') === 'yes') {
+    if (frp_get_cached_option('frp_enable_toc', 'yes') === 'yes') {
         preg_match_all('/<h2[^>]*>(.*?)<\/h2>/i', $content, $matches);
         
         if (!empty($matches[1])) {
@@ -1784,8 +2063,8 @@ add_action('wp_head', 'frp_add_toc_schema_markup', 5); // Run early to avoid con
  * Generate tags for post
  */
 function frp_generate_post_tags($content) {
-    $api_key = get_option('frp_api_key');
-    $model = get_option('frp_model', 'gpt-4o-mini');
+    $api_key = frp_get_cached_option('frp_api_key');
+    $model = frp_get_cached_option('frp_model', 'gpt-4o-mini');
     
     if (empty($api_key) || strlen($content) < 50) {
         return [];
@@ -1808,17 +2087,31 @@ function frp_generate_post_tags($content) {
     ]);
     
     if (is_wp_error($response)) {
+        frp_log_message("OpenAI API error in tag generation: " . $response->get_error_message());
+        return [];
+    }
+    
+    $response_code = wp_remote_retrieve_response_code($response);
+    if ($response_code !== 200) {
+        $response_body = wp_remote_retrieve_body($response);
+        frp_log_message("OpenAI API HTTP error in tag generation: Code {$response_code}. Body: " . substr($response_body, 0, 300));
         return [];
     }
     
     $body = json_decode(wp_remote_retrieve_body($response), true);
     
-    if (isset($body['choices'][0]['message']['content'])) {
-        $tag_text = $body['choices'][0]['message']['content'];
-        return array_map('trim', explode(',', $tag_text));
+    if (isset($body['error'])) {
+        frp_log_message("OpenAI API error in tag generation: " . $body['error']['message']);
+        return [];
     }
     
-    return [];
+    $tag_text = $body['choices'][0]['message']['content'] ?? null;
+    if (!$tag_text) {
+        frp_log_message("OpenAI API invalid response for tag generation");
+        return [];
+    }
+    
+    return array_map('trim', explode(',', $tag_text));
 }
 
 /**
@@ -1945,6 +2238,14 @@ function frp_set_post_thumbnail($post_id, $image_url) {
     // Generate attachment metadata
     require_once(ABSPATH . 'wp-admin/includes/image.php');
     $metadata = wp_generate_attachment_metadata($attach_id, $file_path);
+    
+    if (!$metadata) {
+        @unlink($file_path);
+        wp_delete_attachment($attach_id, true);
+        frp_log_message("  -> Failed to generate attachment metadata");
+        return false;
+    }
+    
     wp_update_attachment_metadata($attach_id, $metadata);
     
     // Set as featured image
@@ -1976,6 +2277,14 @@ add_action('admin_menu', 'frp_add_admin_menu');
  * Render settings page
  */
 function frp_render_settings_page() {
+    // Auto-reschedule cron if not scheduled (fixes "Cron job is not scheduled" warning)
+    $cron_status = get_option('frp_cron_status', 'active');
+    if ($cron_status === 'active' && !wp_next_scheduled(FRP_CRON_HOOK)) {
+        frp_schedule_main_cron();
+        frp_schedule_individual_crons();
+        frp_log_message("Auto-rescheduled cron jobs because they were not scheduled");
+    }
+    
     // Handle Pause All Crons
     if (isset($_POST['frp_pause_all']) && check_admin_referer('frp_cron_control')) {
         frp_pause_all_crons();
@@ -2064,6 +2373,17 @@ function frp_render_settings_page() {
         echo '<div class="notice notice-success"><p>Lock cleared.</p></div>';
     }
     
+    if (isset($_POST['frp_reschedule_cron']) && check_admin_referer('frp_manual_run')) {
+        $cron_status = get_option('frp_cron_status', 'active');
+        if ($cron_status === 'active') {
+            frp_schedule_main_cron();
+            frp_schedule_individual_crons();
+            echo '<div class="notice notice-success"><p>✅ Cron jobs have been rescheduled. Check logs for details.</p></div>';
+        } else {
+            echo '<div class="notice notice-warning"><p>⚠️ Plugin is paused. Resume cron jobs first before rescheduling.</p></div>';
+        }
+    }
+    
     // Get current status
     $cron_status = get_option('frp_cron_status', 'active');
     $is_paused = ($cron_status === 'paused');
@@ -2091,35 +2411,48 @@ function frp_render_settings_page() {
         <!-- Cron Control Panel - SEPARATE FORM from settings -->
         <div class="postbox" style="margin: 20px 0; padding: 15px;">
             <h2 style="margin-top: 0;">🤖 Plugin Control Panel</h2>
+            <p style="margin-top: 0; color: #555;">
+                Gunakan panel ini untuk mengontrol proses generate artikel. Setiap aksi akan tercatat di log di bawah halaman ini.
+            </p>
             
             <form method="post" action="">
                 <?php wp_nonce_field('frp_manual_run'); ?>
                 
                 <div style="display: flex; gap: 15px; flex-wrap: wrap; align-items: center;">
                     <?php if ($is_paused) : ?>
-                        <button type="submit" name="frp_resume_all" class="button button-primary" style="font-size: 14px; padding: 8px 20px; height: auto;">
+                        <button type="submit" name="frp_resume_all" class="button button-primary" style="font-size: 14px; padding: 8px 20px; height: auto;" title="Aktifkan kembali semua jadwal cron agar plugin bisa generate artikel otomatis sesuai interval yang diatur">
                             ▶️ Resume All Cron Jobs
                         </button>
                     <?php else : ?>
-                        <button type="submit" name="frp_pause_all" class="button button-secondary" style="font-size: 14px; padding: 8px 20px; height: auto; color: #b32d2e; border-color: #b32d2e;">
+                        <button type="submit" name="frp_pause_all" class="button button-secondary" style="font-size: 14px; padding: 8px 20px; height: auto; color: #b32d2e; border-color: #b32d2e;" title="Hentikan semua cron sementara. Artikel tidak akan digenerate otomatis sampai kamu menekan Resume lagi">
                             ⏸️ Pause All Cron Jobs
                         </button>
                     <?php endif; ?>
                     
-                    <button type="submit" name="frp_run_now" class="button button-primary" style="font-size: 16px; padding: 12px 30px; height: auto; background: #28a745; border-color: #28a745;">
+                    <button type="submit" name="frp_run_now" class="button button-primary" style="font-size: 16px; padding: 12px 30px; height: auto; background: #28a745; border-color: #28a745;" title="Jalankan proses generate artikel sekarang tanpa menunggu cron. Hanya memproses 1 artikel per eksekusi untuk menjaga stabilitas server">
                         🔄 RUN NOW - Process Feeds
                     </button>
                     
-                    <button type="submit" name="frp_clear_lock" class="button" style="color: #666;">
+                    <button type="submit" name="frp_clear_lock" class="button" style="color: #666;" title="Hapus status locked jika proses sebelumnya macet dan kamu ingin menjalankan ulang segera">
                         🔓 Clear Lock
+                    </button>
+                    
+                    <button type="submit" name="frp_reschedule_cron" class="button" style="color: #666;" title="Jadwalkan ulang cron jika tidak terdeteksi atau kamu baru saja mengubah pengaturan interval">
+                        🔄 Reschedule Cron
                     </button>
                 </div>
             </form>
             
-            <p class="description" style="margin-top: 15px;">
-                <strong>Run Now:</strong> Langsung eksekusi feed processing tanpa menunggu cron.<br>
-                <strong>Pause/Resume:</strong> Mengaktifkan atau menonaktifkan jadwal cron otomatis.
-            </p>
+            <div style="margin-top: 15px; padding: 12px; background: #f9f9f9; border-left: 4px solid #0073aa;">
+                <strong>📘 Panduan Cepat:</strong>
+                <ul style="margin: 8px 0 0 18px; padding: 0;">
+                    <li><strong>RUN NOW</strong>: Jalankan manual sekarang. Cek bagian <strong>Recent Logs</strong> untuk melihat progres dan hasil.</li>
+                    <li><strong>Pause/Resume</strong>: Matikan atau nyalakan cron otomatis. Saat paused, artikel tidak akan digenerate kecuali kamu tekan <strong>RUN NOW</strong>.</li>
+                    <li><strong>Clear Lock</strong>: Jika tombol <strong>RUN NOW</strong> tidak bisa diklik karena masih proses sebelumnya, gunakan ini untuk reset status.</li>
+                    <li><strong>Reschedule Cron</strong>: Tekan ini jika ada warning "Cron job is not scheduled" atau kamu baru mengubah interval cron.</li>
+                    <li><strong>Save Settings</strong>: Jangan lupa simpan pengaturan di bawah terlebih dahulu sebelum menjalankan proses.</li>
+                </ul>
+            </div>
         </div>
         
         <hr>
@@ -2235,7 +2568,7 @@ function frp_pause_all_crons() {
     // Clear any running lock
     delete_transient(FRP_TRANSIENT_PREFIX . 'cron_running');
     
-    frp_log_message("⏸️ All cron jobs PAUSED by user - plugin is now idle");
+    frp_log_message("⏸️ Semua cron dijeda oleh user. Plugin sekarang tidak akan generate artikel otomatis. Tekan Resume untuk mengaktifkan kembali.");
 }
 
 /**
@@ -2254,7 +2587,7 @@ function frp_resume_all_crons() {
     // Clear any stale lock
     delete_transient(FRP_TRANSIENT_PREFIX . 'cron_running');
     
-    frp_log_message("▶️ All cron jobs RESUMED by user - individual crons scheduled");
+    frp_log_message("▶️ Semua cron sudah dijalankan kembali. Artikel akan digenerate otomatis sesuai interval yang diatur di Settings.");
 }
 
 /**
@@ -2262,7 +2595,7 @@ function frp_resume_all_crons() {
  */
 function frp_display_log($max_lines = 30) {
     if (!file_exists(FRP_LOG_FILE)) {
-        return '<p>No logs yet.</p>';
+        return '<p>No logs yet. Log akan muncul di sini setelah kamu menjalankan proses generate artikel.</p>';
     }
     
     $lines = file(FRP_LOG_FILE, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
@@ -2270,17 +2603,41 @@ function frp_display_log($max_lines = 30) {
     $lines = array_reverse($lines);
     
     $output = '<div style="max-height: 400px; overflow-y: auto; background: #f5f5f5; padding: 15px; border: 1px solid #ddd; font-family: monospace; font-size: 11px;">';
+    $output .= '<div style="display: flex; gap: 12px; margin-bottom: 10px; font-size: 11px; color: #555;">';
+    $output .= '<span style="color: #28a745;">● SUCCESS</span>';
+    $output .= '<span style="color: #dc3545;">● ERROR</span>';
+    $output .= '<span style="color: #6f42c1;">● HEADER</span>';
+    $output .= '<span style="color: #dba617;">● WARNING</span>';
+    $output .= '<span style="color: #333;">● INFO</span>';
+    $output .= '</div>';
     
     foreach ($lines as $line) {
         $color = '#333';
-        if (strpos($line, 'SUCCESS') !== false) $color = '#28a745';
-        elseif (strpos($line, 'ERROR') !== false) $color = '#dc3545';
-        elseif (strpos($line, '=== ') !== false) $color = '#6f42c1';
+        $icon = '•';
         
-        $output .= '<div style="color: ' . $color . '; margin-bottom: 2px;">' . esc_html($line) . '</div>';
+        if (strpos($line, 'SUCCESS') !== false) {
+            $color = '#28a745';
+            $icon = '✔';
+        } elseif (strpos($line, 'ERROR') !== false) {
+            $color = '#dc3545';
+            $icon = '✖';
+        } elseif (strpos($line, '=== ') !== false) {
+            $color = '#6f42c1';
+            $icon = '◆';
+        } elseif (strpos($line, 'WARNING') !== false || strpos($line, '⚠️') !== false) {
+            $color = '#dba617';
+            $icon = '⚠';
+        } elseif (strpos($line, '[MANUAL]') !== false || strpos($line, '[CRON]') !== false) {
+            $color = '#0073aa';
+            $icon = '▶';
+        }
+        
+        $output .= '<div style="color: ' . $color . '; margin-bottom: 3px; line-height: 1.4;">' . esc_html($icon . ' ' . $line) . '</div>';
     }
     
     $output .= '</div>';
+    $output .= '<p style="margin-top: 8px; font-size: 11px; color: #777;">Log menampilkan maksimal ' . intval($max_lines) . ' baris terbaru. Untuk melihat log lengkap, buka file <code>' . esc_html(FRP_LOG_FILE) . '</code>.</p>';
+    
     return $output;
 }
 
@@ -2380,8 +2737,7 @@ function frp_api_key_field() {
 function frp_model_field() {
     $val = get_option('frp_model', 'gpt-4o-mini');
     echo '<select name="frp_model">';
-    // Most Economical
-    echo '<option value="gpt-4o-mini" ' . selected($val, 'gpt-4o-mini', false) . '>GPT-4o Mini (Most Economical - $0.15/1M input)</option>';
+    echo '<option value="gpt-4o-mini" ' . selected($val, 'gpt-4o-mini', false) . '>GPT-4o Mini (Default - Most Economical)</option>';
     echo '<option value="gpt-4.1-nano" ' . selected($val, 'gpt-4.1-nano', false) . '>GPT-4.1 Nano - $0.10/1M input</option>';
     echo '<option value="gpt-3.5-turbo-0125" ' . selected($val, 'gpt-3.5-turbo-0125', false) . '>GPT-3.5 Turbo (0125) - $0.50/1M input</option>';
     // Mid-Range
@@ -2397,8 +2753,10 @@ function frp_model_field() {
     // GPT-5 Series
     echo '<option value="gpt-5-mini" ' . selected($val, 'gpt-5-mini', false) . '>GPT-5 Mini - $0.15/1M input</option>';
     echo '<option value="gpt-5" ' . selected($val, 'gpt-5', false) . '>GPT-5 - $2.00/1M input</option>';
+    echo '<option value="gpt-5.4-nano-2026-03-17" ' . selected($val, 'gpt-5.4-nano-2026-03-17', false) . '>GPT-5.4 Nano (2026-03-17) - default temperature only</option>';
+    echo '<option value="gpt-5.6-luna" ' . selected($val, 'gpt-5.6-luna', false) . '>GPT-5.6 Luna - default temperature only</option>';
     echo '</select>';
-    echo '<p class="description">Pilih model sesuai budget. GPT-4o Mini sangat ekonomis dan cocok untuk rewrite artikel.</p>';
+    echo '<p class="description">Pilih model sesuai budget. GPT-4o Mini sangat ekonomis dan cocok untuk rewrite artikel. Beberapa model baru hanya mendukung temperature default (1).</p>';
 }
 
 function frp_language_field() {
@@ -2418,6 +2776,7 @@ function frp_max_tokens_field() {
 function frp_temperature_field() {
     $val = get_option('frp_temperature', 0.5);
     echo '<input type="number" name="frp_temperature" value="' . esc_attr($val) . '" min="0" max="2" step="0.1" />';
+    echo '<p class="description">0 = deterministic, 1 = default, 2 = creative. Beberapa model GPT-5 terbaru hanya mendukung nilai default (1).</p>';
 }
 
 function frp_keyword_filter_field() {
@@ -2678,6 +3037,8 @@ function frp_add_internal_links($post_id, $content, $category_id = '') {
 function frp_log_message($message, $is_manual = null) {
     static $last_message = '';
     static $last_time = 0;
+    static $buffer = [];
+    static $last_flush = 0;
     
     // Prevent duplicate messages within 30 seconds
     if ($message === $last_message && (time() - $last_time) < 30) {
@@ -2687,30 +3048,79 @@ function frp_log_message($message, $is_manual = null) {
     $last_message = $message;
     $last_time = time();
     
-    // Check log file size - rotate if too large
-    if (file_exists(FRP_LOG_FILE) && filesize(FRP_LOG_FILE) > FRP_MAX_LOG_SIZE) {
-        // Keep only last 50% of log
-        $lines = file(FRP_LOG_FILE);
-        $keep = array_slice($lines, -floor(count($lines) / 2));
-        file_put_contents(FRP_LOG_FILE, implode('', $keep));
-    }
-    
     $timestamp = current_time('mysql');
-    
-    // FIX: Explicit source indicator - jika parameter $is_manual diset
     if ($is_manual === true) {
         $source = '[MANUAL]';
     } elseif ($is_manual === false) {
         $source = '[CRON]';
     } else {
-        // Fallback to auto-detect
         $source = defined('DOING_CRON') && DOING_CRON ? '[CRON]' : '[MANUAL]';
     }
     
-    $entry = "[{$timestamp}] {$source} {$message}\n";
+    $buffer[] = "[{$timestamp}] {$source} {$message}\n";
     
-    file_put_contents(FRP_LOG_FILE, $entry, FILE_APPEND);
+    // Flush buffer every 5 seconds or when buffer is large
+    if (time() - $last_flush > 5 || count($buffer) > 20) {
+        // Check log file size - rotate if too large
+        if (file_exists(FRP_LOG_FILE) && filesize(FRP_LOG_FILE) > FRP_MAX_LOG_SIZE) {
+            $lines = file(FRP_LOG_FILE);
+            $keep = array_slice($lines, -floor(count($lines) / 2));
+            file_put_contents(FRP_LOG_FILE, implode('', $keep));
+        }
+        
+        file_put_contents(FRP_LOG_FILE, implode('', $buffer), FILE_APPEND);
+        $buffer = [];
+        $last_flush = time();
+    }
 }
+
+/**
+ * Async post-processing handler
+ * Handles heavy operations (image, tags, SEO) in separate requests to prevent timeouts
+ */
+function frp_handle_async_post_process($post_id, $image_url, $title, $content, $config_num) {
+    if (!$post_id || !get_post($post_id)) {
+        return;
+    }
+    
+    // Mark as processing to prevent duplicate runs
+    if (get_post_meta($post_id, '_frp_processing_done', true)) {
+        return;
+    }
+    
+    frp_log_message("Async post-processing started for post #{$post_id}");
+    
+    // Set featured image
+    if (!empty($image_url)) {
+        frp_set_post_thumbnail($post_id, $image_url);
+    }
+    
+    // Generate tags only if enabled
+    $enable_tags = frp_get_cached_option('frp_enable_tags', '1');
+    if ($enable_tags === '1') {
+        $tags = frp_generate_post_tags($content);
+        if (!empty($tags)) {
+            wp_set_post_tags($post_id, $tags);
+        }
+    }
+    
+    // Add SEO optimizations
+    frp_add_seo_meta($post_id, $title, $content, $image_url);
+    
+    // Add Schema.org structured data
+    frp_add_schema_markup($post_id, $title, $content, $image_url);
+    
+    // Mark as done
+    update_post_meta($post_id, '_frp_processing_done', 1);
+    
+    // Clear scheduling lock to allow future reprocessing if needed
+    delete_transient(FRP_TRANSIENT_PREFIX . 'async_scheduled_' . $post_id);
+    
+    frp_log_message("Async post-processing completed for post #{$post_id}");
+}
+
+// Hook for async post-processing
+add_action('frp_async_post_process', 'frp_handle_async_post_process', 10, 5);
 
 /**
  * Reschedule cron when settings change
@@ -2758,7 +3168,7 @@ function frp_check_system_requirements() {
     // Check WordPress timeout
     $wp_timeout = defined('WP_HTTP_REQUEST_TIMEOUT') ? WP_HTTP_REQUEST_TIMEOUT : 5;
     if ($wp_timeout < 30) {
-        $issues[] = "WordPress HTTP request timeout is {$wp_timeout} seconds. Recommended: 30+ seconds for API calls.";
+        $recommendations[] = "WordPress HTTP request timeout is {$wp_timeout} seconds. Recommended: 30+ seconds for API calls. Note: This plugin uses its own request timeouts, so this is not a blocker.";
     }
     
     // Check memory limit
@@ -2769,13 +3179,30 @@ function frp_check_system_requirements() {
     }
     
     // Check if cron is working
-    if (!wp_next_scheduled(FRP_CRON_HOOK)) {
-        $issues[] = "Cron job is not scheduled. Please save settings to fix.";
+    $main_cron_scheduled = wp_next_scheduled(FRP_CRON_HOOK);
+    if (!$main_cron_scheduled) {
+        $issues[] = "Main cron job is not scheduled. Please save settings to fix, or click Reschedule Cron below.";
+    }
+    
+    // Check individual feed crons
+    $missing_feed_crons = [];
+    for ($i = 1; $i <= FRP_MAX_FEEDS; $i++) {
+        $feed_url = get_option("frp_feed_url_{$i}", '');
+        if (!empty($feed_url) && !wp_next_scheduled("frp_feed_cron_{$i}")) {
+            $missing_feed_crons[] = "Feed #{$i}";
+        }
+    }
+    
+    if (!empty($missing_feed_crons)) {
+        $issues[] = "Individual feed cron(s) not scheduled: " . implode(', ', $missing_feed_crons) . ". Please save settings to fix.";
     }
     
     // Recommendations
     if (get_option('frp_enable_enhanced_research', '1') === '1') {
-        $recommendations[] = "Enhanced Research Mode is ON - requires more processing time. Keep cron interval at 30+ minutes.";
+        $cron_interval = get_option('frp_cron_interval', 60);
+        if ((int) $cron_interval < 30) {
+            $recommendations[] = "Enhanced Research Mode is ON - requires more processing time. Keep cron interval at 30+ minutes.";
+        }
     }
     
     $max_tokens = get_option('frp_max_tokens', 1500);
