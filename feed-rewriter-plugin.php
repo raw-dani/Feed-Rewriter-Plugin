@@ -59,15 +59,19 @@ function frp_get_cached_article_html($article_url) {
         return false;
     }
     
-    $cache_key = 'frp_article_html_' . md5($article_url);
-    $html = get_transient($cache_key);
-    if ($html !== false) {
-        return $html;
+    // Per-request static cache to avoid redundant network calls during the same execution
+    // without bloating wp_options table with megabytes of HTML
+    static $memory_cache = [];
+    $cache_key = md5($article_url);
+    if (isset($memory_cache[$cache_key])) {
+        return $memory_cache[$cache_key];
     }
     
     $response = wp_remote_get($article_url, [
-        'timeout' => 10,
-        'user-agent' => 'Mozilla/5.0 (WordPress Feed Rewriter Plugin)',
+        'timeout' => 8,
+        'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'sslverify' => false,
+        'redirection' => 3,
     ]);
     
     if (is_wp_error($response)) {
@@ -79,7 +83,12 @@ function frp_get_cached_article_html($article_url) {
         return false;
     }
     
-    set_transient($cache_key, $html, 12 * HOUR_IN_SECONDS);
+    // Limit memory footprint: only keep up to 300KB of HTML per page
+    if (strlen($html) > 300000) {
+        $html = substr($html, 0, 300000);
+    }
+    
+    $memory_cache[$cache_key] = $html;
     return $html;
 }
 
@@ -89,6 +98,7 @@ function frp_get_cached_article_html($article_url) {
  */
 function frp_model_supports_temperature($model) {
     $models_without_custom_temperature = [
+        'gpt-6-luna',
         'gpt-5.6-luna',
         'gpt-5.4-nano-2026-03-17',
     ];
@@ -136,10 +146,19 @@ function frp_preload_options() {
  * Retries post-processing for posts created by the plugin but not fully processed
  */
 function frp_cleanup_stuck_async_posts() {
+    // Run cleanup only once every 2 hours to avoid repeated unindexed meta queries
+    $cooldown_key = FRP_TRANSIENT_PREFIX . 'cleanup_stuck_cooldown';
+    if (get_transient($cooldown_key)) {
+        return;
+    }
+    set_transient($cooldown_key, true, 2 * HOUR_IN_SECONDS);
+
     $stuck_posts = get_posts([
         'post_type' => 'post',
-        'posts_per_page' => 10,
+        'posts_per_page' => 5,
         'post_status' => 'publish',
+        'no_found_rows' => true,
+        'update_post_term_cache' => false,
         'meta_query' => [
             [
                 'key' => '_frp_generated',
@@ -152,6 +171,7 @@ function frp_cleanup_stuck_async_posts() {
         ],
         'date_query' => [
             [
+                'after' => '24 hours ago',
                 'before' => '1 hour ago',
             ],
         ],
@@ -432,7 +452,7 @@ function frp_process_blogger_text_feed($config_num, $body, $feed_url, $category,
     $max_items = apply_filters('frp_max_feed_items', 10);
     
     $item_count = 0;
-    foreach ($entries as $entry) {
+    foreach ($items as $item) {
         $item_count++;
         if ($item_count > $max_items) {
             frp_log_message("Batas maksimum artikel per proses tercapai ({$max_items}). Naikkan batas hanya jika server memungkinkan.");
@@ -511,9 +531,12 @@ function frp_process_blogger_text_feed($config_num, $body, $feed_url, $category,
                 $config_num
             ]);
             
-            // Update processed URLs - use item ID
+            // Update processed URLs - use item ID (keep max 250 latest URLs)
             if (!empty($item_id)) {
                 $processed_urls[] = $item_id;
+                if (count($processed_urls) > 250) {
+                    $processed_urls = array_slice($processed_urls, -250);
+                }
                 update_option("frp_processed_urls_{$config_num}", $processed_urls);
             }
             update_option("frp_last_run_config_{$config_num}", time());
@@ -720,6 +743,22 @@ function frp_cron_handler($timestamp) {
     // Clean up stuck async posts on every cron run
     frp_cleanup_stuck_async_posts();
     
+    // Check if any individual feed cron is scheduled
+    $has_individual_crons = false;
+    for ($i = 1; $i <= FRP_MAX_FEEDS; $i++) {
+        if (wp_next_scheduled("frp_feed_cron_{$i}")) {
+            $has_individual_crons = true;
+            break;
+        }
+    }
+    
+    // If individual feed crons are active, let them handle each feed separately
+    // to prevent duplicate simultaneous executions. Main cron serves as a fallback.
+    if ($has_individual_crons) {
+        frp_log_message("Individual feed crons are active. Main cron acting as supervisor/fallback.");
+        return;
+    }
+    
     frp_log_message("Cron otomatis dimulai. Mencari feed yang siap diproses...");
     
     // Call the main function with is_manual = false
@@ -843,29 +882,7 @@ function frp_schedule_individual_crons() {
         return;
     }
     
-    // Register all individual feed schedules FIRST before calling wp_get_schedules()
-    // This ensures schedules are available when wp_schedule_event() is called
-    for ($i = 1; $i <= FRP_MAX_FEEDS; $i++) {
-        $feed_url = get_option("frp_feed_url_{$i}", '');
-        
-        // Only register schedule if feed URL is not empty
-        if (!empty($feed_url)) {
-            $interval = get_option("frp_cron_interval_{$i}", 60);
-            $interval = max(1, intval($interval));
-            $schedule_name = 'frp_feed_interval_' . $i;
-            
-            // Register this feed's interval dynamically
-            add_filter('cron_schedules', function($schedules) use ($i, $interval) {
-                $schedules['frp_feed_interval_' . $i] = [
-                    'interval' => $interval * 60,
-                    'display'  => sprintf(__('Feed #%d every %d minutes', 'feed-rewriter-plugin'), $i, $interval)
-                ];
-                return $schedules;
-            });
-        }
-    }
-    
-    // Now call wp_get_schedules() to ensure all schedules are registered and cache is populated
+    // Ensure all schedules are refreshed and cache is populated
     wp_get_schedules();
     
     // Now schedule individual crons
@@ -1147,8 +1164,11 @@ function frp_process_single_feed_v2($config_num, $is_manual = false) {
                 $config_num
             ]);
             
-            // Update processed URLs
+            // Update processed URLs (keep max 250 latest URLs to prevent option bloat)
             $processed_urls[] = $link;
+            if (count($processed_urls) > 250) {
+                $processed_urls = array_slice($processed_urls, -250);
+            }
             update_option("frp_processed_urls_{$config_num}", $processed_urls);
             update_option("frp_last_run_config_{$config_num}", time());
             
@@ -1298,9 +1318,12 @@ function frp_process_atom_feed($config_num, $xml, $feed_url, $category, $custom_
                 $config_num
             ]);
             
-            // Update processed URLs
+            // Update processed URLs (keep max 250 latest URLs to prevent option bloat)
             if (!empty($link)) {
                 $processed_urls[] = $link;
+                if (count($processed_urls) > 250) {
+                    $processed_urls = array_slice($processed_urls, -250);
+                }
                 update_option("frp_processed_urls_{$config_num}", $processed_urls);
             }
             update_option("frp_last_run_config_{$config_num}", time());
@@ -1465,11 +1488,13 @@ function frp_extract_image_from_url($article_url) {
             $url = $images->item(0)->nodeValue;
             if (!empty($url)) {
                 frp_log_message("  -> Found Featured Image: " . substr($url, 0, 50) . "...");
+                unset($doc, $xpath);
                 return $url;
             }
         }
     }
     
+    unset($doc, $xpath);
     frp_log_message("  -> No image found in article");
     return '';
 }
@@ -1575,6 +1600,7 @@ function frp_extract_links_from_article($article_url, $max_links = 3) {
             }
         }
     }
+    unset($doc, $anchor_tags);
     
     frp_log_message("  -> Found " . count($links) . " related links");
     
@@ -1590,12 +1616,17 @@ function frp_extract_links_from_article($article_url, $max_links = 3) {
 function frp_collect_additional_content($urls) {
     $additional_contents = [];
     
+    // Limit to max 2 sources in practice to prevent high memory & execution time
+    $urls = array_slice($urls, 0, 2);
+    
     foreach ($urls as $url) {
         frp_log_message("  -> Fetching additional content from: " . substr($url, 0, 40) . "...");
         
         $response = wp_remote_get($url, [
-            'timeout' => 15,
-            'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'timeout' => 6,
+            'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'sslverify' => false,
+            'redirection' => 2,
         ]);
         
         if (is_wp_error($response)) {
@@ -1606,6 +1637,11 @@ function frp_collect_additional_content($urls) {
         $html = wp_remote_retrieve_body($response);
         if (empty($html)) {
             continue;
+        }
+        
+        // Truncate HTML to 150KB to protect RAM
+        if (strlen($html) > 150000) {
+            $html = substr($html, 0, 150000);
         }
         
         $doc = new DOMDocument();
@@ -1625,24 +1661,27 @@ function frp_collect_additional_content($urls) {
         $content = '';
         foreach ($content_selectors as $selector) {
             $nodes = $xpath->query($selector);
-            if ($nodes->length > 3) { // Need at least a few paragraphs
+            if ($nodes->length > 2) {
                 foreach ($nodes as $node) {
                     $text = trim($node->textContent);
                     // Skip very short paragraphs (likely navigation or ads)
                     if (strlen($text) > 50) {
                         $content .= $text . "\n\n";
                     }
-                }
-                if (strlen($content) > 200) {
-                    break;
+                    if (strlen($content) > 1500) {
+                        break 2;
+                    }
                 }
             }
         }
         
+        // Clean up DOM objects to immediately free memory
+        unset($doc, $xpath, $html);
+        
         if (!empty($content)) {
             $additional_contents[] = [
                 'url' => $url,
-                'content' => substr($content, 0, 2000) // Limit to 2000 chars
+                'content' => substr($content, 0, 1200) // Limit to 1200 chars
             ];
             frp_log_message("  -> Collected " . strlen($content) . " characters from additional source");
         }
@@ -2072,18 +2111,22 @@ function frp_generate_post_tags($content) {
     
     $prompt = "Based on this content:\n\n" . substr($content, 0, 1000) . "\n\nGenerate 5 relevant tags. Format: tag1, tag2, tag3, tag4, tag5";
     
+    $tag_request_body = [
+        'model' => $model,
+        'messages' => [['role' => 'user', 'content' => $prompt]],
+        'max_tokens' => 50,
+    ];
+    if (frp_model_supports_temperature($model)) {
+        $tag_request_body['temperature'] = 0.5;
+    }
+    
     $response = wp_remote_post('https://api.openai.com/v1/chat/completions', [
         'headers' => [
             'Content-Type' => 'application/json',
             'Authorization' => 'Bearer ' . $api_key
         ],
-        'body' => json_encode([
-            'model' => $model,
-            'messages' => [['role' => 'user', 'content' => $prompt]],
-            'max_tokens' => 50,
-            'temperature' => 0.5
-        ]),
-        'timeout' => 20
+        'body' => json_encode($tag_request_body),
+        'timeout' => 10
     ]);
     
     if (is_wp_error($response)) {
@@ -2111,7 +2154,16 @@ function frp_generate_post_tags($content) {
         return [];
     }
     
-    return array_map('trim', explode(',', $tag_text));
+    $raw_tags = explode(',', $tag_text);
+    $valid_tags = [];
+    foreach ($raw_tags as $t) {
+        $clean = trim($t);
+        // Only accept reasonable tag length (between 2 and 50 characters)
+        if (strlen($clean) >= 2 && strlen($clean) <= 50) {
+            $valid_tags[] = $clean;
+        }
+    }
+    return array_unique($valid_tags);
 }
 
 /**
@@ -2157,9 +2209,9 @@ function frp_set_post_thumbnail($post_id, $image_url) {
         return false;
     }
     
-    // Validate file size (max 10MB)
-    if (strlen($image_data) > 10 * 1024 * 1024) {
-        frp_log_message("  -> Image file too large (>10MB)");
+    // Validate file size (max 4MB instead of 10MB to protect memory limit)
+    if (strlen($image_data) > 4 * 1024 * 1024) {
+        frp_log_message("  -> Image file too large (>4MB), skipped to save memory");
         return false;
     }
     
@@ -2199,12 +2251,22 @@ function frp_set_post_thumbnail($post_id, $image_url) {
         return false;
     }
     
+    // Free image_data memory immediately
+    unset($image_data);
+    
     // Validate that it's actually an image using getimagesize
     $image_info = @getimagesize($file_path);
     if (!$image_info) {
         // Not a valid image - delete and return
         @unlink($file_path);
         frp_log_message("  -> Downloaded file is not a valid image");
+        return false;
+    }
+    
+    // Prevent giant dimensions that crash GD/Imagick memory during thumbnail generation (e.g. > 3000px)
+    if ($image_info[0] > 3500 || $image_info[1] > 3500) {
+        @unlink($file_path);
+        frp_log_message("  -> Image dimensions too large ({$image_info[0]}x{$image_info[1]}), skipped to prevent memory exhaustion");
         return false;
     }
     
@@ -2286,13 +2348,13 @@ function frp_render_settings_page() {
     }
     
     // Handle Pause All Crons
-    if (isset($_POST['frp_pause_all']) && check_admin_referer('frp_cron_control')) {
+    if (isset($_POST['frp_pause_all']) && (check_admin_referer('frp_cron_control', '_wpnonce', false) || check_admin_referer('frp_manual_run', '_wpnonce', false))) {
         frp_pause_all_crons();
         echo '<div class="notice notice-warning"><p><strong>⏸️ Paused:</strong> All cron jobs have been paused. Plugin is now idle and will not consume server resources.</p></div>';
     }
     
     // Handle Resume All Crons
-    if (isset($_POST['frp_resume_all']) && check_admin_referer('frp_cron_control')) {
+    if (isset($_POST['frp_resume_all']) && (check_admin_referer('frp_cron_control', '_wpnonce', false) || check_admin_referer('frp_manual_run', '_wpnonce', false))) {
         frp_resume_all_crons();
         echo '<div class="notice notice-success"><p><strong>▶️ Resumed:</strong> All cron jobs have been resumed. Plugin is now active.</p></div>';
     }
@@ -2388,164 +2450,138 @@ function frp_render_settings_page() {
     $cron_status = get_option('frp_cron_status', 'active');
     $is_paused = ($cron_status === 'paused');
     ?>
-    <div class="wrap">
-        <h1>Feed Rewriter Settings</h1>
+    <div class="wrap" style="max-width: 1100px;">
+        <h1 style="font-size: 24px; font-weight: 700; color: #1d2327; margin-bottom: 15px; display: flex; align-items: center; gap: 10px;">
+            <span>📰 Feed Rewriter Plugin</span>
+            <span style="font-size: 12px; font-weight: 600; background: #2271b1; color: #fff; padding: 2px 8px; border-radius: 10px;">v<?php echo esc_html(FRP_VERSION); ?></span>
+        </h1>
         
         <?php
         // Show prominent status banner
         if ($is_paused) {
-            echo '<div class="notice notice-warning" style="padding: 15px; margin: 20px 0;">';
-            echo '<p style="font-size: 16px; margin: 0;"><span style="font-size: 20px;">⏸️</span> <strong>Plugin is PAUSED</strong> - All cron jobs are disabled. No articles will be generated automatically.</p>';
+            echo '<div style="background: #fff8e5; border-left: 4px solid #dba617; padding: 14px 18px; border-radius: 4px; margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between;">';
+            echo '<div style="font-size: 14px; color: #614700;"><span style="font-size: 18px; margin-right: 8px;">⏸️</span> <strong>Plugin Status: PAUSED</strong> — Semua cron otomatis dihentikan sementara.</div>';
+            echo '<span style="font-size: 12px; background: #fbe7b3; color: #614700; padding: 3px 10px; border-radius: 12px; font-weight: 600;">CRON DISABLED</span>';
             echo '</div>';
         } else {
             $next_run = wp_next_scheduled(FRP_CRON_HOOK);
-            if ($next_run) {
-                $time_diff = human_time_diff(time(), $next_run);
-                echo '<div class="notice notice-success" style="padding: 15px; margin: 20px 0;">';
-                echo '<p style="font-size: 16px; margin: 0;"><span style="font-size: 20px;">✅</span> <strong>Plugin is ACTIVE</strong> - Next run in ' . esc_html($time_diff) . '.</p>';
-                echo '</div>';
-            }
+            $time_diff = $next_run ? human_time_diff(time(), $next_run) : 'pending';
+            echo '<div style="background: #edf8ee; border-left: 4px solid #46b450; padding: 14px 18px; border-radius: 4px; margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between;">';
+            echo '<div style="font-size: 14px; color: #144e19;"><span style="font-size: 18px; margin-right: 8px;">✅</span> <strong>Plugin Status: ACTIVE</strong> — Cron aktif berjalan. Jadwal berikutnya dalam: <strong>' . esc_html($time_diff) . '</strong>.</div>';
+            echo '<span style="background: #d1f0d3; color: #144e19; padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: 600;">READY</span>';
+            echo '</div>';
         }
         ?>
         
-        <!-- Cron Control Panel - SEPARATE FORM from settings -->
-        <div class="postbox" style="margin: 20px 0; padding: 15px;">
-            <h2 style="margin-top: 0;">🤖 Plugin Control Panel</h2>
-            <p style="margin-top: 0; color: #555;">
-                Gunakan panel ini untuk mengontrol proses generate artikel. Setiap aksi akan tercatat di log di bawah halaman ini.
-            </p>
+        <!-- Control Panel Card -->
+        <div style="background: #fff; border: 1px solid #ccd0d4; border-radius: 8px; padding: 20px 24px; margin-bottom: 25px; box-shadow: 0 1px 3px rgba(0,0,0,0.03);">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; border-bottom: 1px solid #f0f0f1; padding-bottom: 10px;">
+                <h2 style="margin: 0; font-size: 16px; font-weight: 600; color: #1d2327;">⚡ Control Center & Quick Actions</h2>
+                <span style="font-size: 12px; color: #646970;">Jalankan atau kendalikan proses artikel secara instan</span>
+            </div>
             
             <form method="post" action="">
                 <?php wp_nonce_field('frp_manual_run'); ?>
                 
-                <div style="display: flex; gap: 15px; flex-wrap: wrap; align-items: center;">
+                <div style="display: flex; gap: 12px; flex-wrap: wrap; align-items: center;">
+                    <button type="submit" name="frp_run_now" class="button button-primary" style="font-size: 14px; font-weight: 600; padding: 6px 20px; height: 38px; background: #00a32a; border-color: #00a32a; display: inline-flex; align-items: center; gap: 6px;" title="Ambil dan rewrite feed secara langsung sekarang">
+                        <span>▶️</span> Run Feeds Now
+                    </button>
+                    
                     <?php if ($is_paused) : ?>
-                        <button type="submit" name="frp_resume_all" class="button button-primary" style="font-size: 14px; padding: 8px 20px; height: auto;" title="Aktifkan kembali semua jadwal cron agar plugin bisa generate artikel otomatis sesuai interval yang diatur">
-                            ▶️ Resume All Cron Jobs
+                        <button type="submit" name="frp_resume_all" class="button button-secondary" style="font-size: 13px; padding: 4px 16px; height: 38px; color: #1e7e34;" title="Nyalakan kembali cron otomatis">
+                            ▶️ Resume All Crons
                         </button>
                     <?php else : ?>
-                        <button type="submit" name="frp_pause_all" class="button button-secondary" style="font-size: 14px; padding: 8px 20px; height: auto; color: #b32d2e; border-color: #b32d2e;" title="Hentikan semua cron sementara. Artikel tidak akan digenerate otomatis sampai kamu menekan Resume lagi">
-                            ⏸️ Pause All Cron Jobs
+                        <button type="submit" name="frp_pause_all" class="button button-secondary" style="font-size: 13px; padding: 4px 16px; height: 38px; color: #d63638;" title="Jeda semua cron otomatis">
+                            ⏸️ Pause All Crons
                         </button>
                     <?php endif; ?>
                     
-                    <button type="submit" name="frp_run_now" class="button button-primary" style="font-size: 16px; padding: 12px 30px; height: auto; background: #28a745; border-color: #28a745;" title="Jalankan proses generate artikel sekarang tanpa menunggu cron. Hanya memproses 1 artikel per eksekusi untuk menjaga stabilitas server">
-                        🔄 RUN NOW - Process Feeds
-                    </button>
-                    
-                    <button type="submit" name="frp_clear_lock" class="button" style="color: #666;" title="Hapus status locked jika proses sebelumnya macet dan kamu ingin menjalankan ulang segera">
+                    <button type="submit" name="frp_clear_lock" class="button button-secondary" style="font-size: 13px; padding: 4px 16px; height: 38px; color: #50575e;" title="Buka lock jika proses sebelumnya tertahan">
                         🔓 Clear Lock
                     </button>
                     
-                    <button type="submit" name="frp_reschedule_cron" class="button" style="color: #666;" title="Jadwalkan ulang cron jika tidak terdeteksi atau kamu baru saja mengubah pengaturan interval">
-                        🔄 Reschedule Cron
+                    <button type="submit" name="frp_reschedule_cron" class="button button-secondary" style="font-size: 13px; padding: 4px 16px; height: 38px; color: #50575e;" title="Reset ulang antrean cron sesuai interval">
+                        🔄 Refresh Schedules
                     </button>
                 </div>
             </form>
+        </div>
+        
+        <!-- Status & Settings Layout Grid -->
+        <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 24px; align-items: start;">
+            <!-- Left Column: Settings Form -->
+            <div style="background: #fff; border: 1px solid #ccd0d4; border-radius: 8px; padding: 22px 26px; box-shadow: 0 1px 3px rgba(0,0,0,0.03);">
+                <h2 style="margin-top: 0; font-size: 17px; font-weight: 600; color: #1d2327; border-bottom: 1px solid #f0f0f1; padding-bottom: 12px; margin-bottom: 15px;">⚙️ Plugin Configuration</h2>
+                
+                <form method="post" action="options.php">
+                    <?php settings_fields('frp_settings_group'); ?>
+                    <?php do_settings_sections('frp_settings'); ?>
+                    <div style="margin-top: 25px; padding-top: 15px; border-top: 1px solid #f0f0f1;">
+                        <?php submit_button('💾 Save All Settings', 'primary', 'submit', false, ['style' => 'font-size: 15px; font-weight: 600; padding: 6px 24px;']); ?>
+                    </div>
+                </form>
+            </div>
             
-            <div style="margin-top: 15px; padding: 12px; background: #f9f9f9; border-left: 4px solid #0073aa;">
-                <strong>📘 Panduan Cepat:</strong>
-                <ul style="margin: 8px 0 0 18px; padding: 0;">
-                    <li><strong>RUN NOW</strong>: Jalankan manual sekarang. Cek bagian <strong>Recent Logs</strong> untuk melihat progres dan hasil.</li>
-                    <li><strong>Pause/Resume</strong>: Matikan atau nyalakan cron otomatis. Saat paused, artikel tidak akan digenerate kecuali kamu tekan <strong>RUN NOW</strong>.</li>
-                    <li><strong>Clear Lock</strong>: Jika tombol <strong>RUN NOW</strong> tidak bisa diklik karena masih proses sebelumnya, gunakan ini untuk reset status.</li>
-                    <li><strong>Reschedule Cron</strong>: Tekan ini jika ada warning "Cron job is not scheduled" atau kamu baru mengubah interval cron.</li>
-                    <li><strong>Save Settings</strong>: Jangan lupa simpan pengaturan di bawah terlebih dahulu sebelum menjalankan proses.</li>
-                </ul>
+            <!-- Right Column: Status & Live Info -->
+            <div>
+                <!-- System Status Box -->
+                <div style="background: #fff; border: 1px solid #ccd0d4; border-radius: 8px; padding: 18px 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.03);">
+                    <h3 style="margin: 0 0 12px 0; font-size: 15px; font-weight: 600; color: #1d2327; border-bottom: 1px solid #f0f0f1; padding-bottom: 8px;">📊 System Status</h3>
+                    
+                    <table style="width: 100%; font-size: 12px; line-height: 1.6;">
+                        <tr>
+                            <td style="color: #646970; padding: 4px 0;">Status:</td>
+                            <td style="text-align: right; padding: 4px 0;"><?php echo $is_paused ? '<span style="color: #dba617; font-weight: 700;">Paused ⏸</span>' : '<span style="color: #46b450; font-weight: 700;">Active ✓</span>'; ?></td>
+                        </tr>
+                        <tr>
+                            <td style="color: #646970; padding: 4px 0;">Last Executed:</td>
+                            <td style="text-align: right; padding: 4px 0; color: #1d2327;"><?php echo esc_html(get_option('frp_last_cron_run', 'Never')); ?></td>
+                        </tr>
+                        <tr>
+                            <td style="color: #646970; padding: 4px 0;">Process Lock:</td>
+                            <td style="text-align: right; padding: 4px 0;">
+                                <?php echo get_transient(FRP_TRANSIENT_PREFIX . 'cron_running') ? '<span style="color: #dba617; font-weight: 600;">Locked (In Progress)</span>' : '<span style="color: #46b450; font-weight: 600;">Idle / Ready</span>'; ?>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td colspan="2" style="padding-top: 10px; font-weight: 600; color: #1d2327; border-top: 1px dashed #f0f0f1;">Feed Schedules:</td>
+                        </tr>
+                        <?php
+                        for ($i = 1; $i <= FRP_MAX_FEEDS; $i++) {
+                            $feed_url = get_option("frp_feed_url_{$i}", '');
+                            echo '<tr><td style="color: #646970; padding: 2px 0;">Feed #' . $i . ':</td><td style="text-align: right; padding: 2px 0;">';
+                            if (!empty($feed_url)) {
+                                $next_run_feed = wp_next_scheduled("frp_feed_cron_{$i}");
+                                echo $next_run_feed ? '<span style="color: #1e7e34;">in ' . human_time_diff(time(), $next_run_feed) . '</span>' : '<span style="color: #b32d2e;">Not queued</span>';
+                            } else {
+                                echo '<span style="color: #8c8f94;">Empty</span>';
+                            }
+                            echo '</td></tr>';
+                        }
+                        ?>
+                    </table>
+                </div>
+                
+                <!-- Generated Articles Widget -->
+                <div style="background: #fff; border: 1px solid #ccd0d4; border-radius: 8px; padding: 18px 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.03);">
+                    <h3 style="margin: 0 0 10px 0; font-size: 15px; font-weight: 600; color: #1d2327; border-bottom: 1px solid #f0f0f1; padding-bottom: 8px;">📝 Generated Articles</h3>
+                    <div style="font-size: 12px; line-height: 1.5;">
+                        <?php echo frp_display_generated_articles(); ?>
+                    </div>
+                </div>
             </div>
         </div>
         
-        <hr>
-        
-        <h2>Settings Configuration</h2>
-        <form method="post" action="options.php">
-            <?php settings_fields('frp_settings_group'); ?>
-            <?php do_settings_sections('frp_settings'); ?>
-            <?php submit_button('Save Settings'); ?>
-        </form>
-        
-        <hr>
-        
-        <h2>Status Information</h2>
-        <table class="widefat" style="max-width: 500px;">
-            <tr>
-                <td><strong>Cron Status:</strong></td>
-                <td>
-                    <?php 
-                    if ($is_paused) {
-                        echo '<span style="color: #dba617; font-weight: bold;">⏸️ Paused</span>';
-                    } else {
-                        echo '<span style="color: #46b450; font-weight: bold;">✅ Active</span>';
-                    }
-                    ?>
-                </td>
-            </tr>
-            <tr>
-                <td><strong>Last Run:</strong></td>
-                <td><?php echo get_option('frp_last_cron_run', 'Never'); ?></td>
-            </tr>
-            <?php
-            $next_run = wp_next_scheduled(FRP_CRON_HOOK);
-            if ($next_run && !$is_paused) {
-                echo '<tr>';
-                echo '<td><strong>Next Scheduled:</strong></td>';
-                echo '<td>' . date('Y-m-d H:i:s', $next_run) . ' (in ' . human_time_diff(time(), $next_run) . ')</td>';
-                echo '</tr>';
-            }
-            
-            // Check if cron is actually scheduled
-            $cron_array = _get_cron_array();
-            $frp_cron_found = false;
-            foreach ($cron_array as $timestamp => $cron) {
-                if (isset($cron[FRP_CRON_HOOK])) {
-                    $frp_cron_found = true;
-                    break;
-                }
-            }
-            
-            echo '<tr>';
-            echo '<td><strong>Cron Scheduled:</strong></td>';
-            echo '<td>' . ($frp_cron_found ? '<span style="color: #46b450;">Yes ✓</span>' : '<span style="color: #dc3232;">No ✗</span>') . '</td>';
-            echo '</tr>';
-            
-            // Show individual feed cron status
-            echo '<tr>';
-            echo '<td><strong>Individual Feed Crons:</strong></td>';
-            echo '<td>';
-            for ($i = 1; $i <= FRP_MAX_FEEDS; $i++) {
-                $feed_url = get_option("frp_feed_url_{$i}", '');
-                if (!empty($feed_url)) {
-                    $next_feed_run = wp_next_scheduled("frp_feed_cron_{$i}");
-                    if ($next_feed_run) {
-                        echo "Feed #{$i}: " . human_time_diff(time(), $next_feed_run) . "<br>";
-                    } else {
-                        echo "Feed #{$i}: <span style='color: #dc3232;'>Not scheduled</span><br>";
-                    }
-                } else {
-                    echo "Feed #{$i}: <span style='color: #999;'>Empty (excluded)</span><br>";
-                }
-            }
-            echo '</td>';
-            echo '</tr>';
-            
-            // Show lock status
-            $lock = get_transient(FRP_TRANSIENT_PREFIX . 'cron_running');
-            echo '<tr>';
-            echo '<td><strong>Lock Status:</strong></td>';
-            echo '<td>' . ($lock ? '<span style="color: #dba617;">Locked (running)</span>' : '<span style="color: #46b450;">Unlocked</span>') . '</td>';
-            echo '</tr>';
-            ?>
-        </table>
-        
-        <hr>
-        
-        <h2>Recent Logs</h2>
-        <?php echo frp_display_log(30); ?>
-        
-        <hr>
-        
-        <h2>Generated Articles (Last 20)</h2>
-        <?php echo frp_display_generated_articles(); ?>
+        <!-- Live Log Console -->
+        <div style="background: #fff; border: 1px solid #ccd0d4; border-radius: 8px; padding: 20px 24px; margin-top: 25px; box-shadow: 0 1px 3px rgba(0,0,0,0.03);">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                <h3 style="margin: 0; font-size: 16px; font-weight: 600; color: #1d2327;">📜 Activity & Processing Logs</h3>
+                <span style="font-size: 12px; color: #646970;">30 log baris terakhir</span>
+            </div>
+            <?php echo frp_display_log(30); ?>
+        </div>
     </div>
     <?php
 }
@@ -2598,7 +2634,30 @@ function frp_display_log($max_lines = 30) {
         return '<p>No logs yet. Log akan muncul di sini setelah kamu menjalankan proses generate artikel.</p>';
     }
     
-    $lines = file(FRP_LOG_FILE, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    // Efficiently read only the tail of the file to save RAM
+    $file_size = filesize(FRP_LOG_FILE);
+    if ($file_size === 0) {
+        return '<p>Log file is empty.</p>';
+    }
+    
+    $buffer_size = min(32768, $file_size); // Read last 32KB max
+    $fp = @fopen(FRP_LOG_FILE, 'r');
+    if (!$fp) {
+        return '<p>Could not read log file.</p>';
+    }
+    
+    fseek($fp, -$buffer_size, SEEK_END);
+    $text = fread($fp, $buffer_size);
+    fclose($fp);
+    
+    $raw_lines = explode("\n", $text);
+    $lines = [];
+    foreach ($raw_lines as $l) {
+        $trimmed = trim($l);
+        if (!empty($trimmed)) {
+            $lines[] = $trimmed;
+        }
+    }
     $lines = array_slice($lines, -$max_lines);
     $lines = array_reverse($lines);
     
@@ -2651,7 +2710,9 @@ function frp_display_generated_articles() {
         'meta_key' => '_frp_generated',
         'meta_value' => '1',
         'orderby' => 'date',
-        'order' => 'DESC'
+        'order' => 'DESC',
+        'no_found_rows' => true, // Skips counting total rows, saving DB resource
+        'update_post_term_cache' => false,
     ]);
     
     if (!$query->have_posts()) {
@@ -2755,8 +2816,10 @@ function frp_model_field() {
     echo '<option value="gpt-5" ' . selected($val, 'gpt-5', false) . '>GPT-5 - $2.00/1M input</option>';
     echo '<option value="gpt-5.4-nano-2026-03-17" ' . selected($val, 'gpt-5.4-nano-2026-03-17', false) . '>GPT-5.4 Nano (2026-03-17) - default temperature only</option>';
     echo '<option value="gpt-5.6-luna" ' . selected($val, 'gpt-5.6-luna', false) . '>GPT-5.6 Luna - default temperature only</option>';
+    // GPT-6 Series
+    echo '<option value="gpt-6-luna" ' . selected($val, 'gpt-6-luna', false) . '>GPT-6 Luna (Next-Gen) - default temperature only</option>';
     echo '</select>';
-    echo '<p class="description">Pilih model sesuai budget. GPT-4o Mini sangat ekonomis dan cocok untuk rewrite artikel. Beberapa model baru hanya mendukung temperature default (1).</p>';
+    echo '<p class="description">Pilih model sesuai budget. GPT-4o Mini sangat ekonomis dan cocok untuk rewrite artikel. Model Luna (GPT-5.6 Luna / GPT-6 Luna) menggunakan nilai temperature default secara otomatis.</p>';
 }
 
 function frp_language_field() {
@@ -2831,16 +2894,40 @@ function frp_feed_config_field($num) {
     $prompt = get_option("frp_custom_prompt_{$num}", 'Rewrite the following content:');
     
     $categories = get_categories(['hide_empty' => false]);
+    $is_filled = !empty($url);
     
-    echo '<div style="background: #f9f9f9; padding: 15px; margin: 10px 0; border: 1px solid #ddd;">';
-    echo '<p><label>Feed URL:</label><br><textarea name="frp_feed_url_' . $num . '" rows="2" class="regular-text">' . esc_textarea($url) . '</textarea></p>';
-    echo '<p><label>Category:</label><br><select name="frp_selected_category_' . $num . '"><option value="">Select</option>';
+    echo '<div style="background: #ffffff; padding: 18px 20px; margin: 10px 0 20px 0; border: 1px solid #ccd0d4; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.04);">';
+    echo '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; border-bottom: 1px solid #f0f0f1; padding-bottom: 8px;">';
+    echo '<strong style="font-size: 14px; color: #1d2327;">📡 Feed Source #' . $num . '</strong>';
+    echo $is_filled ? '<span style="background: #e7f5ea; color: #1e7e34; padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 600;">ACTIVE</span>' : '<span style="background: #f0f0f1; color: #646970; padding: 3px 10px; border-radius: 12px; font-size: 11px;">EMPTY</span>';
+    echo '</div>';
+    
+    echo '<div style="margin-bottom: 12px;">';
+    echo '<label style="display: block; font-weight: 600; margin-bottom: 4px; color: #2c3338;">RSS / Atom Feed URL:</label>';
+    echo '<input type="url" name="frp_feed_url_' . $num . '" value="' . esc_attr($url) . '" class="large-text" placeholder="https://example.com/rss atau https://domain.com/feed" style="border-radius: 4px;" />';
+    echo '</div>';
+    
+    echo '<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; margin-bottom: 12px;">';
+    echo '<div>';
+    echo '<label style="display: block; font-weight: 600; margin-bottom: 4px; color: #2c3338;">Target Category:</label>';
+    echo '<select name="frp_selected_category_' . $num . '" style="width: 100%; max-width: 100%; border-radius: 4px;">';
+    echo '<option value="">— Uncategorized / Default —</option>';
     foreach ($categories as $c) {
         echo '<option value="' . $c->term_id . '" ' . selected($cat, $c->term_id, false) . '>' . esc_html($c->name) . '</option>';
     }
-    echo '</select></p>';
-    echo '<p><label>Interval (minutes):</label><br><input type="number" name="frp_cron_interval_' . $num . '" value="' . esc_attr($interval) . '" min="1" style="width: 80px;" /></p>';
-    echo '<p><label>Custom Prompt:</label><br><textarea name="frp_custom_prompt_' . $num . '" rows="2" class="regular-text">' . esc_textarea($prompt) . '</textarea></p>';
+    echo '</select>';
+    echo '</div>';
+    
+    echo '<div>';
+    echo '<label style="display: block; font-weight: 600; margin-bottom: 4px; color: #2c3338;">Fetch Interval (Minutes):</label>';
+    echo '<input type="number" name="frp_cron_interval_' . $num . '" value="' . esc_attr($interval) . '" min="1" style="width: 100%; border-radius: 4px;" />';
+    echo '</div>';
+    echo '</div>';
+    
+    echo '<div>';
+    echo '<label style="display: block; font-weight: 600; margin-bottom: 4px; color: #2c3338;">Custom AI Rewrite Prompt (Optional):</label>';
+    echo '<textarea name="frp_custom_prompt_' . $num . '" rows="2" class="large-text" placeholder="Tulis instruksi khusus rewrite artikel..." style="border-radius: 4px;">' . esc_textarea($prompt) . '</textarea>';
+    echo '</div>';
     echo '</div>';
 }
 
@@ -2897,7 +2984,10 @@ function frp_add_seo_meta($post_id, $title, $content, $image_url = '') {
  */
 function frp_add_schema_markup($post_id, $title, $content, $image_url = '') {
     $post = get_post($post_id);
-    $author = get_the_author_meta('display_name', $post->post_author);
+    if (!$post) {
+        return;
+    }
+    $author = get_the_author_meta('display_name', $post->post_author) ?: get_bloginfo('name');
     $site_name = get_bloginfo('name');
     
     // Get primary category
@@ -2957,6 +3047,63 @@ function frp_output_schema_markup() {
 add_action('wp_head', 'frp_output_schema_markup', 99);
 
 /**
+ * Output Open Graph and Twitter Card meta tags in <head>
+ * Fully flexible: automatically skips if a known SEO plugin is active to avoid duplicates
+ */
+function frp_output_seo_meta_tags() {
+    if (!is_single()) {
+        return;
+    }
+
+    $post_id = get_the_ID();
+    if (!get_post_meta($post_id, '_frp_generated', true)) {
+        return;
+    }
+
+    // Check if any major SEO plugin is already active handling Open Graph & Twitter Cards
+    if (
+        defined('WPSEO_VERSION') ||               // Yoast SEO
+        defined('RANK_MATH_VERSION') ||           // Rank Math SEO
+        defined('AIOSEO_VERSION') ||              // All in One SEO
+        defined('SEOPRESS_VERSION') ||            // SEOPress
+        defined('THE_SEO_FRAMEWORK_PRESENT') ||   // The SEO Framework
+        class_exists('Jetpack') && class_exists('Jetpack_OpenGraph') // Jetpack Open Graph
+    ) {
+        return; // Skip output to avoid duplicate tags
+    }
+
+    $title = get_post_meta($post_id, '_og_title', true) ?: get_the_title($post_id);
+    $description = get_post_meta($post_id, '_og_description', true) ?: wp_trim_words(wp_strip_all_tags(get_post_field('post_content', $post_id)), 30, '');
+    $image = get_post_meta($post_id, '_og_image', true);
+    if (empty($image) && has_post_thumbnail($post_id)) {
+        $image = get_the_post_thumbnail_url($post_id, 'full');
+    }
+    $url = get_permalink($post_id);
+    $site_name = get_bloginfo('name');
+    $card_type = get_post_meta($post_id, '_twitter_card_type', true) ?: 'summary_large_image';
+
+    echo "\n<!-- Feed Rewriter Plugin Open Graph & Twitter Cards -->\n";
+    echo '<meta property="og:locale" content="' . esc_attr(get_locale()) . "\" />\n";
+    echo '<meta property="og:type" content="article" />' . "\n";
+    echo '<meta property="og:title" content="' . esc_attr($title) . "\" />\n";
+    echo '<meta property="og:description" content="' . esc_attr($description) . "\" />\n";
+    echo '<meta property="og:url" content="' . esc_url($url) . "\" />\n";
+    echo '<meta property="og:site_name" content="' . esc_attr($site_name) . "\" />\n";
+    if (!empty($image)) {
+        echo '<meta property="og:image" content="' . esc_url($image) . "\" />\n";
+    }
+
+    echo '<meta name="twitter:card" content="' . esc_attr($card_type) . "\" />\n";
+    echo '<meta name="twitter:title" content="' . esc_attr($title) . "\" />\n";
+    echo '<meta name="twitter:description" content="' . esc_attr($description) . "\" />\n";
+    if (!empty($image)) {
+        echo '<meta name="twitter:image" content="' . esc_url($image) . "\" />\n";
+    }
+    echo "<!-- /Feed Rewriter Plugin Open Graph & Twitter Cards -->\n\n";
+}
+add_action('wp_head', 'frp_output_seo_meta_tags', 1);
+
+/**
  * Add Internal Links to generated content - SEO Optimized
  * Links to related articles based on category or keywords
  */
@@ -2980,7 +3127,9 @@ function frp_add_internal_links($post_id, $content, $category_id = '') {
         'meta_key' => '_frp_generated',
         'meta_value' => '1',
         'orderby' => 'date',
-        'order' => 'DESC'
+        'order' => 'DESC',
+        'no_found_rows' => true,
+        'update_post_term_cache' => false,
     ];
     
     // If category is specified, filter by category
@@ -3061,11 +3210,24 @@ function frp_log_message($message, $is_manual = null) {
     
     // Flush buffer every 5 seconds or when buffer is large
     if (time() - $last_flush > 5 || count($buffer) > 20) {
-        // Check log file size - rotate if too large
+        // Check log file size - rotate if too large without loading entire 5MB into memory
         if (file_exists(FRP_LOG_FILE) && filesize(FRP_LOG_FILE) > FRP_MAX_LOG_SIZE) {
-            $lines = file(FRP_LOG_FILE);
-            $keep = array_slice($lines, -floor(count($lines) / 2));
-            file_put_contents(FRP_LOG_FILE, implode('', $keep));
+            $fp = @fopen(FRP_LOG_FILE, 'r');
+            if ($fp) {
+                // Keep only the last 1MB of the log file
+                $keep_bytes = 1048576;
+                fseek($fp, -$keep_bytes, SEEK_END);
+                $remaining_logs = fread($fp, $keep_bytes);
+                fclose($fp);
+                
+                // Trim to the first clean newline
+                $first_nl = strpos($remaining_logs, "\n");
+                if ($first_nl !== false) {
+                    $remaining_logs = substr($remaining_logs, $first_nl + 1);
+                }
+                file_put_contents(FRP_LOG_FILE, $remaining_logs);
+                unset($remaining_logs);
+            }
         }
         
         file_put_contents(FRP_LOG_FILE, implode('', $buffer), FILE_APPEND);
@@ -3116,11 +3278,82 @@ function frp_handle_async_post_process($post_id, $image_url, $title, $content, $
     // Clear scheduling lock to allow future reprocessing if needed
     delete_transient(FRP_TRANSIENT_PREFIX . 'async_scheduled_' . $post_id);
     
+    // Purge cache across popular caching systems (LiteSpeed, WP Rocket, Cloudflare, etc.)
+    frp_purge_post_cache($post_id);
+    
     frp_log_message("Async post-processing completed for post #{$post_id}");
 }
 
 // Hook for async post-processing
 add_action('frp_async_post_process', 'frp_handle_async_post_process', 10, 5);
+
+/**
+ * Automatically purge cache for the post, homepage, and category archives
+ * Supports LiteSpeed Cache, WP Rocket, Cloudflare, W3 Total Cache, WP Super Cache, Autoptimize, etc.
+ */
+function frp_purge_post_cache($post_id) {
+    if (!$post_id) {
+        return;
+    }
+
+    $purged = [];
+
+    // 1. LiteSpeed Cache
+    if (defined('LSCWP_V') || class_exists('LiteSpeed\Purge')) {
+        do_action('litespeed_purge_post', $post_id);
+        $purged[] = 'LiteSpeed';
+    }
+
+    // 2. WP Rocket
+    if (function_exists('rocket_clean_post')) {
+        rocket_clean_post($post_id);
+        if (function_exists('rocket_clean_home')) {
+            rocket_clean_home();
+        }
+        $purged[] = 'WP Rocket';
+    }
+
+    // 3. Cloudflare (via WordPress plugin)
+    if (class_exists('CF\WordPress\Hooks')) {
+        do_action('cloudflare_purge_by_url', get_permalink($post_id));
+        do_action('cloudflare_purge_by_url', home_url('/'));
+        $purged[] = 'Cloudflare';
+    }
+
+    // 4. W3 Total Cache
+    if (function_exists('w3tc_flush_post')) {
+        w3tc_flush_post($post_id);
+        if (function_exists('w3tc_pgcache_flush')) {
+            w3tc_pgcache_flush();
+        }
+        $purged[] = 'W3 Total Cache';
+    }
+
+    // 5. WP Super Cache
+    if (function_exists('wp_cache_post_change')) {
+        wp_cache_post_change($post_id);
+        $purged[] = 'WP Super Cache';
+    }
+
+    // 6. WP Fastest Cache
+    if (function_exists('wpfc_clear_post_cache_by_id')) {
+        wpfc_clear_post_cache_by_id($post_id);
+        $purged[] = 'WP Fastest Cache';
+    }
+
+    // 7. Autoptimize
+    if (class_exists('autoptimizeCache')) {
+        autoptimizeCache::clearall();
+        $purged[] = 'Autoptimize';
+    }
+
+    // 8. Clean WordPress internal post cache
+    clean_post_cache($post_id);
+
+    if (!empty($purged)) {
+        frp_log_message("  -> Cache purged for post #{$post_id} via: " . implode(', ', $purged));
+    }
+}
 
 /**
  * Reschedule cron when settings change

@@ -36,6 +36,7 @@ Feed Rewriter Plugin adalah plugin WordPress yang secara otomatis mengambil kont
 - Cron scheduling yang fleksibel
 - Log rotation (5MB max)
 - System requirements check
+- Auto Purge Cache (LiteSpeed, WP Rocket, Cloudflare, W3 Total Cache, dll.)
 
 ## Instalasi
 
@@ -81,6 +82,7 @@ Plugin ini menggunakan model OpenAI dengan biaya sangat terjangkau:
 
 | Model | Harga per 1M tokens |
 |-------|---------------------|
+| GPT-6 Luna | $0.10 |
 | GPT-5.6 Luna | $0.10 |
 | GPT-4.1 Nano | $0.10 |
 | GPT-4o Mini | $0.15 |
@@ -88,9 +90,15 @@ Plugin ini menggunakan model OpenAI dengan biaya sangat terjangkau:
 | GPT-3.5 Turbo | $0.50 |
 | GPT-4o | $2.50 |
 
-**Estimasi biaya**:~$0.01-0.02 per artikel dengan GPT-4o Mini
+**Estimasi biaya**:~$0.01-0.02 per artikel dengan GPT-4o Mini atau GPT-6 Luna
 
 ## Changelog
+
+### Version 1.2.2
+- Tambah dukungan model baru **GPT-6 Luna**
+- Optimasi pemakaian resource & memory footprint (DOMDocument cleanup, stream log rotation)
+- Proteksi parameter temperature untuk model seri Luna
+- Optimasi kueri database (no_found_rows & transient caching)
 
 ### Version 1.1.0
 - Tambah Enhanced Research Mode
