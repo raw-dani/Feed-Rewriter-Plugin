@@ -51,6 +51,123 @@ function frp_get_cached_option($key, $default = false) {
 }
 
 /**
+ * Update cached option in memory and in the database
+ */
+function frp_update_cached_option($key, $value) {
+    update_option($key, $value);
+    // Invalidate static cache in frp_get_cached_option by calling it or resetting
+    frp_get_cached_option($key); // ensures cache initialized
+    // Update local copy using reflection or by relying on option cache
+    wp_cache_delete($key, 'options');
+}
+
+/**
+ * Normalize an article URL to prevent duplicates due to tracking params, trailing slashes, or whitespace
+ */
+function frp_normalize_url($url) {
+    if (empty($url)) {
+        return '';
+    }
+    $url = trim((string)$url);
+    $url = html_entity_decode($url, ENT_QUOTES, 'UTF-8');
+    
+    // Parse URL parts
+    $parsed = parse_url($url);
+    if (!$parsed || empty($parsed['host'])) {
+        return $url;
+    }
+    
+    $scheme = strtolower($parsed['scheme'] ?? 'http');
+    $host = strtolower($parsed['host']);
+    $path = $parsed['path'] ?? '/';
+    $path = rtrim($path, '/');
+    if ($path === '') {
+        $path = '/';
+    }
+    
+    // Filter out common tracking query params
+    $query = '';
+    if (!empty($parsed['query'])) {
+        parse_str($parsed['query'], $query_params);
+        $tracking_keys = [
+            'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+            'fbclid', 'gclid', 'rss', 'feed', '_hsenc', '_hsmi', 'mc_cid', 'mc_eid'
+        ];
+        foreach ($tracking_keys as $tkey) {
+            unset($query_params[$tkey]);
+        }
+        if (!empty($query_params)) {
+            ksort($query_params);
+            $query = '?' . http_build_query($query_params);
+        }
+    }
+    
+    return $scheme . '://' . $host . $path . $query;
+}
+
+/**
+ * Check if an article has already been processed or exists in WordPress
+ */
+function frp_is_article_already_processed($url, $guid = '', $title = '', $processed_urls = []) {
+    $norm_url = frp_normalize_url($url);
+    $norm_guid = !empty($guid) ? trim((string)$guid) : '';
+
+    // 1. Check in processed_urls array (comparing both raw and normalized)
+    if (!empty($processed_urls) && is_array($processed_urls)) {
+        foreach ($processed_urls as $processed) {
+            $p_norm = frp_normalize_url($processed);
+            if (!empty($norm_url) && ($processed === $url || $p_norm === $norm_url)) {
+                return true;
+            }
+            if (!empty($norm_guid) && $processed === $norm_guid) {
+                return true;
+            }
+        }
+    }
+
+    // 2. Query WordPress database by meta key _frp_source_link or _frp_source_guid
+    $meta_queries = [];
+    if (!empty($norm_url)) {
+        $meta_queries[] = [
+            'key' => '_frp_source_link',
+            'value' => $norm_url,
+            'compare' => '='
+        ];
+        if ($norm_url !== $url) {
+            $meta_queries[] = [
+                'key' => '_frp_source_link',
+                'value' => $url,
+                'compare' => '='
+            ];
+        }
+    }
+    if (!empty($norm_guid)) {
+        $meta_queries[] = [
+            'key' => '_frp_source_guid',
+            'value' => $norm_guid,
+            'compare' => '='
+        ];
+    }
+
+    if (!empty($meta_queries)) {
+        $existing = get_posts([
+            'post_type' => 'post',
+            'post_status' => ['publish', 'draft', 'pending', 'future'],
+            'posts_per_page' => 1,
+            'fields' => 'ids',
+            'no_found_rows' => true,
+            'meta_query' => array_merge(['relation' => 'OR'], $meta_queries)
+        ]);
+
+        if (!empty($existing)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
  * Get cached article HTML to avoid duplicate HTTP requests
  * Used when both image extraction and link extraction need the same article page
  */
@@ -460,10 +577,16 @@ function frp_process_blogger_text_feed($config_num, $body, $feed_url, $category,
         }
         
         // Use item ID as unique identifier (Blogger format)
-        $item_id = isset($item['id']) ? $item['id'] : '';
+        $item_id = isset($item['id']) ? trim((string)$item['id']) : '';
         
-        // Skip already processed
-        if ($ignore_processed === '1' && in_array($item_id, $processed_urls)) {
+        // Build article URL from ID if possible
+        $link = '';
+        if (preg_match('/blog-([0-9]+)\.post-([0-9]+)/', $item_id, $matches)) {
+            $link = 'https://workspaceupdates.googleblog.com/' . date('Y/m/d') . '/post-' . $matches[2] . '.html';
+        }
+        
+        // Skip already processed or existing in database
+        if ($ignore_processed === '1' && frp_is_article_already_processed($link, $item_id, $item['title'] ?? '', $processed_urls)) {
             continue;
         }
         
@@ -478,12 +601,6 @@ function frp_process_blogger_text_feed($config_num, $body, $feed_url, $category,
         // Check keyword filters
         if (!frp_check_keyword_filters($title, $content)) {
             continue;
-        }
-        
-        // Build article URL from ID if possible
-        $link = '';
-        if (preg_match('/blog-([0-9]+)\.post-([0-9]+)/', $item_id, $matches)) {
-            $link = 'https://workspaceupdates.googleblog.com/' . date('Y/m/d') . '/post-' . $matches[2] . '.html';
         }
         
         // Check if enhanced research is enabled
@@ -508,12 +625,23 @@ function frp_process_blogger_text_feed($config_num, $body, $feed_url, $category,
             'meta_input' => [
                 '_frp_generated' => 1,
                 '_frp_source_feed' => $feed_url,
-                '_frp_source_link' => $link,
+                '_frp_source_link' => frp_normalize_url($link),
+                '_frp_source_guid' => $item_id,
                 '_frp_config_num' => $config_num
             ],
         ]);
         
         if ($post_id) {
+            // Immediate tag generation to avoid empty tags if WP-Cron fails
+            $enable_tags = frp_get_cached_option('frp_enable_tags', '1');
+            if ($enable_tags === '1') {
+                $tags = frp_generate_post_tags($rewritten['content'], $rewritten['title']);
+                if (!empty($tags)) {
+                    wp_set_post_tags($post_id, $tags, false);
+                    frp_log_message("  -> Tags set immediately for post #{$post_id}: " . implode(', ', $tags));
+                }
+            }
+            
             // Set featured image - try to extract from content
             $image_url = frp_extract_image_from_blogger_item($item);
             
@@ -522,7 +650,7 @@ function frp_process_blogger_text_feed($config_num, $body, $feed_url, $category,
                 $image_url = frp_extract_image_from_url($link);
             }
             
-            // Schedule async post-processing (image, tags, SEO)
+            // Schedule async post-processing (image, SEO, Schema)
             wp_schedule_single_event(time() + 60, 'frp_async_post_process', [
                 $post_id, 
                 $image_url, 
@@ -531,14 +659,18 @@ function frp_process_blogger_text_feed($config_num, $body, $feed_url, $category,
                 $config_num
             ]);
             
-            // Update processed URLs - use item ID (keep max 250 latest URLs)
+            // Update processed URLs - use item ID and normalized link (keep max 1000 latest URLs)
             if (!empty($item_id)) {
                 $processed_urls[] = $item_id;
-                if (count($processed_urls) > 250) {
-                    $processed_urls = array_slice($processed_urls, -250);
-                }
-                update_option("frp_processed_urls_{$config_num}", $processed_urls);
             }
+            if (!empty($link)) {
+                $processed_urls[] = frp_normalize_url($link);
+            }
+            $processed_urls = array_unique($processed_urls);
+            if (count($processed_urls) > 1000) {
+                $processed_urls = array_slice($processed_urls, -1000);
+            }
+            update_option("frp_processed_urls_{$config_num}", $processed_urls);
             update_option("frp_last_run_config_{$config_num}", time());
             
             frp_log_message("SUCCESS: Created post #{$post_id} (async post-processing scheduled)");
@@ -1105,16 +1237,17 @@ function frp_process_single_feed_v2($config_num, $is_manual = false) {
             break;
         }
         
-        $link = (string)$item->link;
+        $link = trim((string)$item->link);
+        $guid = isset($item->guid) ? trim((string)$item->guid) : '';
+        $title = trim((string)$item->title);
         
-        // Skip already processed
-        if ($ignore_processed === '1' && in_array($link, $processed_urls)) {
+        // Skip already processed or existing in database
+        if ($ignore_processed === '1' && frp_is_article_already_processed($link, $guid, $title, $processed_urls)) {
             continue;
         }
         
         // Get content
         $content = frp_extract_feed_content($item);
-        $title = (string)$item->title;
         
         if (empty($content) || strlen($content) < 100) {
             continue;
@@ -1149,12 +1282,23 @@ function frp_process_single_feed_v2($config_num, $is_manual = false) {
             'meta_input' => [
                 '_frp_generated' => 1,
                 '_frp_source_feed' => $feed_url,
-                '_frp_source_link' => $link,
+                '_frp_source_link' => frp_normalize_url($link),
+                '_frp_source_guid' => $guid,
                 '_frp_config_num' => $config_num
             ],
         ]);
         
         if ($post_id) {
+            // Immediate tag generation to avoid empty tags if WP-Cron fails
+            $enable_tags = frp_get_cached_option('frp_enable_tags', '1');
+            if ($enable_tags === '1') {
+                $tags = frp_generate_post_tags($rewritten['content'], $rewritten['title']);
+                if (!empty($tags)) {
+                    wp_set_post_tags($post_id, $tags, false);
+                    frp_log_message("  -> Tags set immediately for post #{$post_id}: " . implode(', ', $tags));
+                }
+            }
+            
             // Set featured image - first try from feed, then fallback to article URL
             $image_url = frp_extract_feed_image($item);
             
@@ -1163,7 +1307,7 @@ function frp_process_single_feed_v2($config_num, $is_manual = false) {
                 $image_url = frp_extract_image_from_url($link);
             }
             
-            // Schedule async post-processing (image, tags, SEO)
+            // Schedule async post-processing (image, SEO, Schema)
             wp_schedule_single_event(time() + 60, 'frp_async_post_process', [
                 $post_id, 
                 $image_url, 
@@ -1172,10 +1316,16 @@ function frp_process_single_feed_v2($config_num, $is_manual = false) {
                 $config_num
             ]);
             
-            // Update processed URLs (keep max 250 latest URLs to prevent option bloat)
-            $processed_urls[] = $link;
-            if (count($processed_urls) > 250) {
-                $processed_urls = array_slice($processed_urls, -250);
+            // Update processed URLs (keep max 1000 latest URLs to prevent option bloat)
+            if (!empty($link)) {
+                $processed_urls[] = frp_normalize_url($link);
+            }
+            if (!empty($guid)) {
+                $processed_urls[] = $guid;
+            }
+            $processed_urls = array_unique($processed_urls);
+            if (count($processed_urls) > 1000) {
+                $processed_urls = array_slice($processed_urls, -1000);
             }
             update_option("frp_processed_urls_{$config_num}", $processed_urls);
             update_option("frp_last_run_config_{$config_num}", time());
@@ -1229,27 +1379,24 @@ function frp_process_atom_feed($config_num, $xml, $feed_url, $category, $custom_
         // Get link - Atom uses <link> with href attribute
         $link = '';
         if (isset($entry->link['href'])) {
-            $link = (string)$entry->link['href'];
+            $link = trim((string)$entry->link['href']);
         } elseif (isset($entry->link)) {
             // Some Atom feeds have link as element with href
             foreach ($entry->link as $lnk) {
                 $rel = $lnk['rel'] ?? '';
                 if (empty($rel) || $rel === 'alternate') {
-                    $link = (string)$lnk['href'];
+                    $link = trim((string)$lnk['href']);
                     break;
                 }
             }
         }
         
-        // Skip already processed
-        if ($ignore_processed === '1' && in_array($link, $processed_urls)) {
-            continue;
-        }
+        $guid = isset($entry->id) ? trim((string)$entry->id) : '';
+        $title = isset($entry->title) ? trim((string)$entry->title) : '';
         
-        // Get title
-        $title = '';
-        if (isset($entry->title)) {
-            $title = (string)$entry->title;
+        // Skip already processed or existing in database
+        if ($ignore_processed === '1' && frp_is_article_already_processed($link, $guid, $title, $processed_urls)) {
+            continue;
         }
         
         // Get content - Atom uses <content> or <summary>
@@ -1293,12 +1440,23 @@ function frp_process_atom_feed($config_num, $xml, $feed_url, $category, $custom_
             'meta_input' => [
                 '_frp_generated' => 1,
                 '_frp_source_feed' => $feed_url,
-                '_frp_source_link' => $link,
+                '_frp_source_link' => frp_normalize_url($link),
+                '_frp_source_guid' => $guid,
                 '_frp_config_num' => $config_num
             ],
         ]);
         
         if ($post_id) {
+            // Immediate tag generation to avoid empty tags if WP-Cron fails
+            $enable_tags = frp_get_cached_option('frp_enable_tags', '1');
+            if ($enable_tags === '1') {
+                $tags = frp_generate_post_tags($rewritten['content'], $rewritten['title']);
+                if (!empty($tags)) {
+                    wp_set_post_tags($post_id, $tags, false);
+                    frp_log_message("  -> Tags set immediately for post #{$post_id}: " . implode(', ', $tags));
+                }
+            }
+            
             // Set featured image - try to extract from content
             $image_url = '';
             
@@ -1317,7 +1475,7 @@ function frp_process_atom_feed($config_num, $xml, $feed_url, $category, $custom_
                 $image_url = frp_extract_image_from_url($link);
             }
             
-            // Schedule async post-processing (image, tags, SEO)
+            // Schedule async post-processing (image, SEO, Schema)
             wp_schedule_single_event(time() + 60, 'frp_async_post_process', [
                 $post_id, 
                 $image_url, 
@@ -1326,14 +1484,18 @@ function frp_process_atom_feed($config_num, $xml, $feed_url, $category, $custom_
                 $config_num
             ]);
             
-            // Update processed URLs (keep max 250 latest URLs to prevent option bloat)
+            // Update processed URLs (keep max 1000 latest URLs to prevent option bloat)
             if (!empty($link)) {
-                $processed_urls[] = $link;
-                if (count($processed_urls) > 250) {
-                    $processed_urls = array_slice($processed_urls, -250);
-                }
-                update_option("frp_processed_urls_{$config_num}", $processed_urls);
+                $processed_urls[] = frp_normalize_url($link);
             }
+            if (!empty($guid)) {
+                $processed_urls[] = $guid;
+            }
+            $processed_urls = array_unique($processed_urls);
+            if (count($processed_urls) > 1000) {
+                $processed_urls = array_slice($processed_urls, -1000);
+            }
+            update_option("frp_processed_urls_{$config_num}", $processed_urls);
             update_option("frp_last_run_config_{$config_num}", time());
             
             frp_log_message("SUCCESS: Created post #{$post_id} (async post-processing scheduled)");
@@ -2109,23 +2271,24 @@ add_action('wp_head', 'frp_add_toc_schema_markup', 5); // Run early to avoid con
 /**
  * Generate tags for post
  */
-function frp_generate_post_tags($content) {
+function frp_generate_post_tags($content, $title = '') {
     $api_key = frp_get_cached_option('frp_api_key');
     $model = frp_get_cached_option('frp_model', 'gpt-4o-mini');
     
-    if (empty($api_key) || strlen($content) < 50) {
-        return [];
+    // Fallback: extract fallback tags if API key empty
+    if (empty($api_key)) {
+        return frp_generate_fallback_tags($title, $content);
     }
     
-    $prompt = "Based on this content:\n\n" . substr($content, 0, 1000) . "\n\nGenerate 5 relevant tags. Format: tag1, tag2, tag3, tag4, tag5";
+    $prompt = "Berdasarkan artikel berikut:\nJudul: {$title}\nKonten: " . substr(strip_tags($content), 0, 1000) . "\n\nBerikan 5 tag relevan untuk WordPress (nama tokoh, tim, event, atau topik). Jawaban HANYA berupa daftar tag dipisahkan koma tanpa pengantar, tanpa nomor, tanpa markdown. Contoh: MotoGP, Francesco Bagnaia, Ducati, Sepang, Berita Balap";
     
     $tag_request_body = [
         'model' => $model,
         'messages' => [['role' => 'user', 'content' => $prompt]],
-        'max_tokens' => 50,
+        'max_tokens' => 100,
     ];
     if (frp_model_supports_temperature($model)) {
-        $tag_request_body['temperature'] = 0.5;
+        $tag_request_body['temperature'] = 0.4;
     }
     
     $response = wp_remote_post('https://api.openai.com/v1/chat/completions', [
@@ -2134,44 +2297,77 @@ function frp_generate_post_tags($content) {
             'Authorization' => 'Bearer ' . $api_key
         ],
         'body' => json_encode($tag_request_body),
-        'timeout' => 10
+        'timeout' => 15
     ]);
     
     if (is_wp_error($response)) {
         frp_log_message("OpenAI API error in tag generation: " . $response->get_error_message());
-        return [];
+        return frp_generate_fallback_tags($title, $content);
     }
     
     $response_code = wp_remote_retrieve_response_code($response);
     if ($response_code !== 200) {
         $response_body = wp_remote_retrieve_body($response);
         frp_log_message("OpenAI API HTTP error in tag generation: Code {$response_code}. Body: " . substr($response_body, 0, 300));
-        return [];
+        return frp_generate_fallback_tags($title, $content);
     }
     
     $body = json_decode(wp_remote_retrieve_body($response), true);
     
     if (isset($body['error'])) {
         frp_log_message("OpenAI API error in tag generation: " . $body['error']['message']);
-        return [];
+        return frp_generate_fallback_tags($title, $content);
     }
     
     $tag_text = $body['choices'][0]['message']['content'] ?? null;
     if (!$tag_text) {
         frp_log_message("OpenAI API invalid response for tag generation");
-        return [];
+        return frp_generate_fallback_tags($title, $content);
     }
     
-    $raw_tags = explode(',', $tag_text);
+    // Clean tag text from common AI preamble or markdown
+    $tag_text = preg_replace('/^(Tags?:|Tag list:|\*\*Tags:\*\*)/i', '', trim($tag_text));
+    $raw_tags = preg_split('/[,;\n]+/', $tag_text);
     $valid_tags = [];
     foreach ($raw_tags as $t) {
-        $clean = trim($t);
+        $clean = trim($t, " \t\n\r\0\x0B-.*#1234567890.");
+        $clean = trim($clean, '"\'');
         // Only accept reasonable tag length (between 2 and 50 characters)
         if (strlen($clean) >= 2 && strlen($clean) <= 50) {
             $valid_tags[] = $clean;
         }
     }
-    return array_unique($valid_tags);
+    
+    $final_tags = array_unique($valid_tags);
+    if (empty($final_tags)) {
+        return frp_generate_fallback_tags($title, $content);
+    }
+    return $final_tags;
+}
+
+/**
+ * Fallback tag generation from title keywords
+ */
+function frp_generate_fallback_tags($title, $content) {
+    if (empty($title)) {
+        return [];
+    }
+    // Extract notable capitalized words or key phrases from title
+    $words = preg_split('/[\s:,.\-\–\—\(\)\[\]]+/u', $title, -1, PREG_SPLIT_NO_EMPTY);
+    $stop_words = [
+        'dan', 'di', 'dari', 'ke', 'ini', 'itu', 'yang', 'pada', 'untuk', 'dengan', 
+        'karena', 'saat', 'oleh', 'bisa', 'akan', 'juga', 'sudah', 'tersebut', 'the',
+        'of', 'in', 'and', 'to', 'a', 'for', 'is', 'on', 'that', 'by', 'this', 'with',
+        'hasil', 'kondisi', 'mundur', 'rebut', 'amankan', 'posisi', 'raih', 'usai'
+    ];
+    $candidates = [];
+    foreach ($words as $w) {
+        $w_clean = trim($w);
+        if (mb_strlen($w_clean) >= 3 && !in_array(mb_strtolower($w_clean), $stop_words, true)) {
+            $candidates[] = $w_clean;
+        }
+    }
+    return array_slice(array_unique($candidates), 0, 5);
 }
 
 /**
@@ -3268,9 +3464,10 @@ function frp_handle_async_post_process($post_id, $image_url, $title, $content, $
     // Generate tags only if enabled
     $enable_tags = frp_get_cached_option('frp_enable_tags', '1');
     if ($enable_tags === '1') {
-        $tags = frp_generate_post_tags($content);
+        $tags = frp_generate_post_tags($content, $title);
         if (!empty($tags)) {
-            wp_set_post_tags($post_id, $tags);
+            wp_set_post_tags($post_id, $tags, false);
+            frp_log_message("  -> Tags set for post #{$post_id}: " . implode(', ', $tags));
         }
     }
     
