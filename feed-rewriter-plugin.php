@@ -211,16 +211,70 @@ function frp_get_cached_article_html($article_url) {
 
 /**
  * Check if a model supports custom temperature parameter
- * Some models like gpt-5.6-luna only support the default temperature value
+ * Some models like gpt-5.6-luna or reasoning models only support the default temperature value
  */
 function frp_model_supports_temperature($model) {
     $models_without_custom_temperature = [
         'gpt-6-luna',
         'gpt-5.6-luna',
         'gpt-5.4-nano-2026-03-17',
+        'o1',
+        'o1-mini',
+        'o1-preview',
+        'o3',
+        'o3-mini',
     ];
     
-    return !in_array(strtolower($model), $models_without_custom_temperature, true);
+    $m = strtolower(trim((string)$model));
+    foreach ($models_without_custom_temperature as $prefix) {
+        if (strpos($m, $prefix) === 0) {
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+/**
+ * Check if a model requires 'max_completion_tokens' instead of 'max_tokens'
+ * OpenAI's newer models (o1, o3, gpt-4o, gpt-5, gpt-6 series) require max_completion_tokens
+ */
+function frp_model_uses_max_completion_tokens($model) {
+    $m = strtolower(trim((string)$model));
+    
+    // Check known models and series that require max_completion_tokens
+    $completion_token_models = [
+        'o1', 'o3', 'gpt-5', 'gpt-6', 'chatgpt-4o'
+    ];
+    
+    foreach ($completion_token_models as $prefix) {
+        if (strpos($m, $prefix) === 0) {
+            return true;
+        }
+    }
+    
+    // Any model with 'luna' or newer suffix
+    if (strpos($m, 'luna') !== false) {
+        return true;
+    }
+    
+    return false;
+}
+
+/**
+ * Helper to attach the correct token limit parameter (max_tokens vs max_completion_tokens)
+ */
+function frp_attach_token_limit(&$request_body, $model, $tokens) {
+    $tokens = (int)$tokens;
+    if ($tokens <= 0) {
+        return;
+    }
+    
+    if (frp_model_uses_max_completion_tokens($model)) {
+        $request_body['max_completion_tokens'] = $tokens;
+    } else {
+        $request_body['max_tokens'] = $tokens;
+    }
 }
 
 /**
@@ -1940,10 +1994,9 @@ function frp_rewrite_with_enhanced_research($title, $content, $custom_prompt, $a
         $request_body['temperature'] = (float) $temperature;
     }
     
-    // Only include max_tokens if it's set and > 0
-    // Some models like gpt-5.6-luna don't accept null for max_tokens
+    // Attach token limit with correct parameter (max_tokens vs max_completion_tokens)
     if ($max_tokens > 0) {
-        $request_body['max_tokens'] = (int) $max_tokens;
+        frp_attach_token_limit($request_body, $model, $max_tokens);
     }
     
     $response = wp_remote_post('https://api.openai.com/v1/chat/completions', [
@@ -2084,10 +2137,9 @@ function frp_rewrite_with_openai($title, $content, $custom_prompt) {
         $request_body['temperature'] = (float) $temperature;
     }
     
-    // Only include max_tokens if it's set and > 0
-    // Some models like gpt-5.6-luna don't accept null for max_tokens
+    // Attach token limit with correct parameter (max_tokens vs max_completion_tokens)
     if ($max_tokens > 0) {
-        $request_body['max_tokens'] = (int) $max_tokens;
+        frp_attach_token_limit($request_body, $model, $max_tokens);
     }
     
     $response = wp_remote_post('https://api.openai.com/v1/chat/completions', [
@@ -2285,8 +2337,8 @@ function frp_generate_post_tags($content, $title = '') {
     $tag_request_body = [
         'model' => $model,
         'messages' => [['role' => 'user', 'content' => $prompt]],
-        'max_tokens' => 100,
     ];
+    frp_attach_token_limit($tag_request_body, $model, 100);
     if (frp_model_supports_temperature($model)) {
         $tag_request_body['temperature'] = 0.4;
     }
